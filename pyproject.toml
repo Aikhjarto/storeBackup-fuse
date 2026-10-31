@@ -1,0 +1,38 @@
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "storebackup-fuse"
+dynamic = ["version"]
+description = "Read-only FUSE filesystem showing storeBackup backups as plain files"
+readme = "README.md"
+license = {text = "GPL-2.0-or-later"}
+authors = [{name = "Thomas Wagner"}]
+requires-python = ">=3.9"
+dependencies = ["pyfuse3", "trio"]
+classifiers = [
+    "License :: OSI Approved :: GNU General Public License v2 or later (GPLv2+)",
+    "Operating System :: POSIX :: Linux",
+    "Programming Language :: Python :: 3",
+    "Topic :: System :: Archiving :: Backup",
+    "Topic :: System :: Filesystems",
+]
+
+[project.urls]
+Homepage = "https://github.com/Aikhjarto/storeBackup-fuse"
+
+[project.scripts]
+storebackup-fuse = "storebackup_fuse.cli:main"
+
+[project.optional-dependencies]
+test = ["pytest"]
+
+[tool.setuptools.dynamic]
+version = {attr = "storebackup_fuse.__version__"}
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
