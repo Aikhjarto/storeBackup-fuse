@@ -456,6 +456,43 @@ def test_hard_links_share_inode(synthetic):
     assert (a.nlink, bb.nlink, c.nlink) == (2, 2, 1)
 
 
+def test_inodes_independent_of_source_inodes(synthetic):
+    """Sources read over sshfs get new device and inode numbers with every
+    mount; unchanged files must keep their inode number anyway."""
+    def make(name, dev):
+        sb = synthetic(name)
+        sb.dir(b'd', dev_inode=f'{dev}-1')
+        sb.file(b'd/f', b'content', dev_inode=f'{dev}-2')
+        sb.file(b'd/g', b'content', dev_inode=f'{dev}-3')
+        sb.file(b'h1', b'linked', dev_inode=f'{dev}-4')
+        sb.file(b'h2', b'linked', dev_inode=f'{dev}-4')
+        sb.symlink(b'd/l', b'f', dev_inode=f'{dev}-5')
+        sb.special('pipe', b'd/p', dev_inode=f'{dev}-6')
+        return Backup(sb.write())
+    one = make('2026.01.01_00.00.00', 53)
+    two = make('2026.01.02_00.00.00', 75)
+    for path in ('d', 'd/f', 'd/g', 'h1', 'h2', 'd/l', 'd/p'):
+        assert one.lookup(path).inode == two.lookup(path).inode, path
+    # same contents at another path is another file
+    assert one.lookup('d/f').inode != one.lookup('d/g').inode
+    assert one.lookup('h1').inode == one.lookup('h2').inode
+    assert one.lookup('h1').nlink == 2
+
+
+def test_reused_source_inode_is_no_hard_link(synthetic):
+    """Two files that got the same source inode one after the other during
+    the backup (e.g. empty temporary files) are not merged."""
+    sb = synthetic()
+    sb.file(b'a', b'', dev_inode='9-9', uid=1, mode=0o600)
+    sb.file(b'b', b'', dev_inode='9-9', uid=2, mode=0o644)
+    sb.file(b'c', b'', dev_inode='9-9', uid=1, mode=0o600, mtime=1)
+    b = Backup(sb.write())
+    a, bb, c = (b.lookup(n) for n in 'abc')
+    assert len({a.inode, bb.inode, c.inode}) == 3
+    assert (a.nlink, bb.nlink, c.nlink) == (1, 1, 1)
+    assert b.by_inode[bb.inode] is bb
+
+
 def test_inodes_are_unique_and_stable(synthetic):
     def make(name):
         sb = synthetic(name)

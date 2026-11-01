@@ -74,11 +74,17 @@ logged.
 
 ### Inode numbers
 
-Inode numbers are derived from the file's MD5 and the inode it had on the
-source, so they are the same in every mount and for every backup in which the
-file is unchanged. This lets restic (and other programs that compare inode,
-size and times with the previous snapshot) skip unchanged files without
-reading them.
+Inode numbers are derived from the file's MD5 and path (directories,
+symlinks and special files: from the path), so they are the same in every
+mount and for every backup in which the file is unchanged. This lets restic
+(and other programs that compare inode, size and times with the previous
+snapshot) skip unchanged files without reading them. The inode numbers of
+the source recorded by storeBackup are not suitable for this: sources read
+over sshfs get new ones with every mount.
+
+Hard links of the source share one inode number; they are recognized by the
+source inode together with contents, owner, mode and mtime, all within one
+backup.
 
 ## Example: moving a storeBackup series to restic
 

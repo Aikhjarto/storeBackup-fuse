@@ -170,7 +170,9 @@ def stable_inode(key, used):
     """Inode number derived from ``key``, the same in every mount.
 
     restic recognizes unchanged files by path, size, times and inode, so a
-    file that is identical in two backups should get the same number.
+    file that is identical in two backups should get the same number.  The
+    source inode in the checksum file cannot serve for that: sources read
+    over sshfs get new device and inode numbers with every mount.
     ``used`` maps inode -> key; collisions (astronomically rare) are
     resolved by probing.
     """
@@ -255,7 +257,7 @@ class Backup:
 
     def _load(self):
         used = {ROOT_INODE: b'/'}
-        links = {}
+        links = {}                  # see _assign_file_inodes
         for line in self._checksum_lines():
             fields = parse_checksum_line(line)
             if fields is not None:
@@ -306,26 +308,37 @@ class Backup:
 
             if entry is self.root:
                 continue
-            if kind == DIR:
-                key = b'd\0' + name
-            elif kind == FILE:
-                # same content and same source inode -> same number in every
-                # backup; source hard links share it as well
-                key = b'f\0' + md5.encode() + b'\0' + dev_inode
-                links[key] = links.get(key, 0) + 1
-            else:
-                key = kind.encode() + b'\0' + dev_inode + b'\0' + name
+            if kind == FILE:
+                links.setdefault((md5, dev_inode, uid, gid, mode, mtime,
+                                  size), []).append(entry)
+                continue
+            key = (b'd' if kind == DIR else kind.encode()) + b'\0' + name
             entry.inode = stable_inode(key, used)
             self.by_inode[entry.inode] = entry
 
         if self.malformed:
             log.warning('%s: %d malformed lines in %s skipped', self.path,
                         self.malformed, CHECKSUM_FILE)
+        self._assign_file_inodes(links, used)
         self._finish_dirs(self.root, used)
-        for entry in self.walk():
-            if entry.kind == FILE:
-                entry.nlink = links[b'f\0' + entry.md5.encode() + b'\0'
-                                    + entry.dev_inode]
+
+    def _assign_file_inodes(self, links, used):
+        """Inode numbers of regular files from contents and path.
+
+        Hard links of the source are recognized by the source inode, which
+        is reliable within one backup.  Entries are only taken as hard links
+        if all attributes of the inode agree as well, so that two files
+        which got the same inode number one after the other during the
+        backup (e.g. temporary files) are not merged.  A group of hard links
+        gets the number of its first path.
+        """
+        for (md5, *_), entries in links.items():
+            first = min(e.path for e in entries)
+            inode = stable_inode(b'f\0' + md5.encode() + b'\0' + first, used)
+            for entry in entries:
+                entry.inode = inode
+                entry.nlink = len(entries)
+            self.by_inode[inode] = entries[0]
 
     def _finish_dirs(self, root, used):
         """Give implicit parent directories an inode and the backup's date,
