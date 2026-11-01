@@ -19,9 +19,7 @@ needs_storebackup = pytest.mark.skipif(
 # -- synthetic backups -----------------------------------------------------
 
 INFO = """version=1.3
-storeBackupVersion=3.5.2
 compress='bzip2'
-uncompress='bzip2' '-d'
 postfix='.bz2'
 archiveTypes=
 """
@@ -33,12 +31,15 @@ HEADER = (b'# contents/md5 compr dev-inode inodeBackup ctime mtime atime '
 class SyntheticBackup:
     """Writes a backup directory in storeBackup's layout by hand."""
 
-    def __init__(self, path, finished=True):
+    def __init__(self, path, finished=True, version='3.5.2',
+                 uncompress="'bzip2' '-d'"):
         self.path = path
         self.lines = []
         os.makedirs(path)
         with open(os.path.join(path, '.md5CheckSums.info'), 'w') as f:
-            f.write(INFO)
+            f.write(INFO + f'uncompress={uncompress}\n')
+            if version:
+                f.write(f'storeBackupVersion={version}\n')
         if finished:
             os.makedirs(os.path.join(path, '.storeBackupLinks'))
             open(os.path.join(path, '.storeBackupLinks',
@@ -63,43 +64,47 @@ class SyntheticBackup:
         os.makedirs(self._target(name), exist_ok=True)
         self._line('dir', '0', 0, mode, name, **kw)
 
-    def file(self, name, data, compr='u', mode=0o644, md5=None, **kw):
+    def file(self, name, data, compr='u', mode=0o644, md5=None,
+             compress=bz2.compress, **kw):
         import hashlib
         target = self._target(name)
         if compr == 'c':
             with open(target + b'.bz2', 'wb') as f:
-                f.write(bz2.compress(data))
+                f.write(compress(data))
         else:
             with open(target, 'wb') as f:
                 f.write(data)
         self._line(md5 or hashlib.md5(data).hexdigest(), compr, len(data),
                    mode, name, **kw)
 
-    def blocked(self, name, data, block_size, compress=True, **kw):
+    def blocked(self, name, data, block_size, compress=True, size=None,
+                md5=None, **kw):
+        """File in blocks; ``size`` and ``md5`` override what goes into
+        the checksum file.  Returns the paths of the stored blocks."""
         import hashlib
         target = self._target(name)
         os.makedirs(target)
-        lines = []
+        lines, paths = [], []
         for i in range(0, max(len(data), 1), block_size):
             block = data[i:i + block_size]
             rel = name + b'/%010d' % (i // block_size + 1)
             if compress:
                 rel += b'.bz2'
-                with open(os.path.join(os.fsencode(self.path), rel),
-                          'wb') as f:
-                    f.write(bz2.compress(block))
+                block_data = bz2.compress(block)
             else:
-                with open(os.path.join(os.fsencode(self.path), rel),
-                          'wb') as f:
-                    f.write(block)
+                block_data = block
+            paths.append(os.path.join(os.fsencode(self.path), rel))
+            with open(paths[-1], 'wb') as f:
+                f.write(block_data)
             lines.append(b'%s %s %s\n' % (hashlib.md5(block).hexdigest()
                                          .encode(),
                                          b'c' if compress else b'u', rel))
         with bz2.open(os.path.join(target, b'.md5BlockCheckSums.bz2'),
                       'wb') as f:
             f.writelines(lines)
-        self._line(hashlib.md5(data).hexdigest(), 'b', len(data), 0o644,
-                   name, **kw)
+        self._line(md5 or hashlib.md5(data).hexdigest(), 'b',
+                   len(data) if size is None else size, 0o644, name, **kw)
+        return paths
 
     def symlink(self, name, to, **kw):
         os.symlink(to, self._target(name))

@@ -2,12 +2,19 @@
 # Copyright (C) 2026 Thomas Wagner
 """Mount backups with the real FUSE module and look at them through the
 kernel.  Skipped where FUSE cannot be used."""
+import bz2
+import concurrent.futures
 import errno
+import gzip
+import hashlib
 import os
+import random
 import shutil
+import signal
 import stat
 import subprocess
 import sys
+import tempfile
 import time
 
 import pytest
@@ -59,8 +66,9 @@ class Mount:
 def mount(tmp_path):
     mounts = []
 
-    def do(backup, *args):
-        m = Mount(backup, tmp_path / f'mnt{len(mounts)}', *args)
+    def do(backup, *args, mountpoint=None):
+        m = Mount(backup, mountpoint or tmp_path / f'mnt{len(mounts)}',
+                  *args)
         mounts.append(m)
         return m
     yield do
@@ -137,21 +145,143 @@ def test_corrupted_file_gives_io_error(synthetic, mount):
     assert 'do not match the checksum file' in m.log
 
 
-def test_permissions_enforced_for_other_users(synthetic, mount):
+@pytest.fixture
+def public_dir():
+    """Directory other users can reach (pytest's own are mode 0700)."""
+    path = tempfile.mkdtemp(prefix='storebackup-fuse-test-')
+    os.chmod(path, 0o755)
+    parent = os.path.dirname(path)
+    while parent != '/':
+        if not os.stat(parent).st_mode & stat.S_IXOTH:
+            os.rmdir(path)
+            pytest.skip(f'{parent} is not accessible for other users')
+        parent = os.path.dirname(parent)
+    yield path
+    shutil.rmtree(path)
+
+
+def test_permissions_enforced_for_other_users(synthetic, mount, public_dir):
     if os.geteuid() != 0:
         pytest.skip('needs root to switch users')
     sb = synthetic()
-    path = os.path.dirname(os.path.abspath(sb.path))
-    while path != '/':
-        if not os.stat(path).st_mode & stat.S_IXOTH:
-            pytest.skip(f'{path} is not accessible for other users')
-        path = os.path.dirname(path)
     sb.file(b'secret', b'x', mode=0o600, uid=0, gid=0)
     sb.file(b'public', b'y', mode=0o644, uid=0, gid=0)
-    m = mount(sb.write(), '--allow-other')
-    os.chmod(os.path.dirname(m.mountpoint), 0o755)
+    m = mount(sb.write(), '--allow-other',
+              mountpoint=os.path.join(public_dir, 'mnt'))
     run = lambda p: subprocess.run(
         ['setpriv', '--reuid=65534', '--regid=65534', '--clear-groups',
          'cat', os.path.join(m.mountpoint, p)], capture_output=True)
     assert run('public').stdout == b'y'
     assert run('secret').returncode != 0
+    m.unmount()
+
+
+def cat(path):
+    """Read a file like cat does; returns its MD5 or the errno."""
+    try:
+        with open(path, 'rb') as f:
+            return hashlib.md5(f.read()).hexdigest()
+    except OSError as e:
+        return e.errno
+
+
+def test_blocked_files_verified_despite_parallel_reads(synthetic, mount):
+    """Read-ahead sends reads of one file in parallel and out of order;
+    neither a wrong MD5 nor a damaged block may pass."""
+    data = os.urandom(8 << 20)
+    sb = synthetic()
+    for i in range(4):
+        sb.blocked(b'wrong-md5-%d.img' % i, data, block_size=256 << 10,
+                   md5='0' * 32)
+        blocks = sb.blocked(b'bad-block-%d.img' % i, data,
+                            block_size=256 << 10)
+        with open(blocks[20], 'wb') as f:
+            f.write(bz2.compress(b'\0' * (256 << 10)))
+    sb.blocked(b'good.img', data, block_size=256 << 10)
+    m = mount(sb.write())
+    for i in range(4):
+        for name in ('wrong-md5-%d.img', 'bad-block-%d.img'):
+            assert cat(os.path.join(m.mountpoint, name % i)) == errno.EIO
+    assert cat(os.path.join(m.mountpoint, 'good.img')) == \
+        hashlib.md5(data).hexdigest()
+    assert m.unmount() == 0, m.log
+
+
+def test_damaged_file_stays_unreadable(synthetic, mount):
+    """Neither the page cache nor a hard link may serve the data of a file
+    that failed the check, nor of one that was read only in part."""
+    data = os.urandom(8 << 20)
+    bad = bytearray(data)
+    bad[5 << 20] ^= 1
+    sb = synthetic()
+    sb.file(b'bad', data, dev_inode='7-7')
+    sb.file(b'bad link', data, dev_inode='7-7')
+    sb.file(b'partly', data)
+    path = sb.write()
+    for name in ('bad', 'bad link', 'partly'):
+        with open(os.path.join(path, name), 'wb') as f:
+            f.write(bad)
+    m = mount(path)
+    j = lambda p: os.path.join(m.mountpoint, p)
+    assert cat(j('bad')) == errno.EIO
+    assert cat(j('bad')) == errno.EIO
+    assert cat(j('bad link')) == errno.EIO
+    with open(j('partly'), 'rb') as f:
+        f.read(4096)
+    assert cat(j('partly')) == errno.EIO
+    m.unmount()
+    assert m.proc.returncode == 0, m.log
+
+
+def test_errors_do_not_end_the_mount(synthetic, mount):
+    sb = synthetic(uncompress="'gzip' '-d'")
+    sb.file(b'damaged.gz.txt', b'x' * 100000, compr='c',
+            compress=gzip.compress)
+    sb.raw_line(b'symlink 0 1-1 0 1 1 1 0 0 0 0 missing-link\n')
+    sb.file(b'ok', b'fine')
+    path = sb.write()
+    with open(os.path.join(path, 'damaged.gz.txt.bz2'), 'r+b') as f:
+        f.seek(20)
+        f.write(b'\xff' * 20)
+    m = mount(path)
+    j = lambda p: os.path.join(m.mountpoint, p)
+    assert sorted(os.listdir(m.mountpoint)) == ['damaged.gz.txt',
+                                                'missing-link', 'ok']
+    assert stat.S_ISLNK(os.lstat(j('missing-link')).st_mode)
+    with pytest.raises(OSError) as e:
+        os.readlink(j('missing-link'))
+    assert e.value.errno == errno.EIO
+    assert cat(j('damaged.gz.txt')) == errno.EIO
+    assert cat(j('ok')) == hashlib.md5(b'fine').hexdigest()
+    assert m.unmount() == 0, m.log
+
+
+def test_parallel_reads_on_one_descriptor(synthetic, mount):
+    data = os.urandom(4 << 20)
+    sb = synthetic()
+    sb.file(b'c.txt', data, compr='c')
+    sb.blocked(b'disk.img', data, block_size=256 << 10)
+    m = mount(sb.write(), '--no-verify')
+    for name in ('c.txt', 'disk.img'):
+        fd = os.open(os.path.join(m.mountpoint, name), os.O_RDONLY |
+                     os.O_DIRECT)
+        try:
+            offsets = [random.Random(i).randrange(len(data) - 65536)
+                       for i in range(200)]
+            with concurrent.futures.ThreadPoolExecutor(8) as pool:
+                for off, got in pool.map(
+                        lambda o: (o, os.pread(fd, 65536, o)), offsets):
+                    assert got == data[off:off + 65536], (name, off)
+        finally:
+            os.close(fd)
+    assert m.unmount() == 0, m.log
+
+
+def test_sigterm_unmounts(synthetic, mount):
+    sb = synthetic()
+    sb.file(b'f', b'x')
+    m = mount(sb.write())
+    m.proc.send_signal(signal.SIGTERM)
+    assert m.proc.wait(timeout=20) == 0
+    assert not os.path.ismount(m.mountpoint)
+    assert os.listdir(m.mountpoint) == []

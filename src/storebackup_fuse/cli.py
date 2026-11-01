@@ -22,9 +22,10 @@ def main(argv=None):
                         '/backup/storeBackup/SERIES/2026.10.31_04.09.14')
     parser.add_argument('mountpoint')
     parser.add_argument('--no-verify', action='store_true',
-                        help='do not check the MD5 of files read in sequence')
+                        help='do not check the MD5 of files and blocks')
     parser.add_argument('--allow-unfinished', action='store_true',
-                        help='also mount backups without finished flag')
+                        help='also mount backups that storeBackup '
+                        'considers unfinished')
     parser.add_argument('--allow-other', action='store_true',
                         help='let other users access the mount (needs '
                         'user_allow_other in /etc/fuse.conf for non-root)')

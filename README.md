@@ -34,8 +34,9 @@ storebackup-fuse /backup/storeBackup/SERIES/2026.10.31_04.09.14 /mnt/sb
 fusermount3 -u /mnt/sb
 ```
 
-The program stays in the foreground until the mountpoint is unmounted;
-start it with `&` or as a systemd unit. Without installing:
+The program stays in the foreground until the mountpoint is unmounted or it
+gets SIGTERM, SIGINT or SIGHUP (then it unmounts itself); start it with `&`
+or as a systemd unit. Without installing:
 `PYTHONPATH=src python3 -m storebackup_fuse BACKUP MOUNTPOINT`.
 
 Options:
@@ -43,21 +44,33 @@ Options:
 | Option | Meaning |
 |---|---|
 | `--no-verify` | Do not check the MD5 sums (see below) |
-| `--allow-unfinished` | Also mount backups without storeBackup's finished flag |
+| `--allow-unfinished` | Also mount backups that storeBackup considers unfinished |
 | `--allow-other` | Let other users access the mount; access is still checked against the recorded owner and mode |
 | `--debug` | Log every FUSE request |
 
-The backup must be complete and its links resolved: backups made with
+The backup must be finished (by the same rule as storeBackup: the flag
+`.storeBackupLinks/backup.Finished`, or for backups of storeBackup ≤ 3.4.3 no
+`.md5CheckSums.notFinished`) and its links resolved: backups made with
 `lateLinks` need `storeBackupUpdateBackup.pl` first, as for
 `storeBackupRecover.pl`.
 
 ### Checksums
 
-When a file is read from start to end in order (as backup programs and `cp`
-do), its MD5 is compared with the one in `.md5CheckSums`. If they differ, the
-read that reaches the end of the file fails with `EIO` and the error is
-logged, so damaged files in the backup do not pass unnoticed. Files read out
-of order are not checked.
+When a file has been read completely (as backup programs and `cp` do, in
+any order of the reads), its size and MD5 are compared with
+`.md5CheckSums`. Files in blocks are also checked block by block against
+their `.md5BlockCheckSums` as the blocks are loaded. On a mismatch, the read
+fails with `EIO`, the error is logged, and the file cannot be opened again
+during this mount (hard links of it neither); data of a file that was not
+checked yet is not kept in the page cache, so a damaged file never reads
+without error. Uncompressed files whose stored size differs from the
+recorded one cannot be opened, also with `--no-verify`. Files read only in
+part, or in a very scattered order, are not checked as a whole.
+
+storeBackup records the size of a file in blocks from before reading it but
+the MD5 of what it read; if the file changed meanwhile (storeBackup logs
+"changed during backup"), it is shown with the recorded size and a warning is
+logged.
 
 ### Inode numbers
 

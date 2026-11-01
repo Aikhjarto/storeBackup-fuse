@@ -24,12 +24,17 @@ import bz2
 import concurrent.futures
 import gzip
 import hashlib
+import logging
 import lzma
 import os
+import re
 import shlex
 import stat
 import subprocess
 import threading
+import zlib
+
+log = logging.getLogger(__name__)
 
 ROOT_INODE = 1
 
@@ -53,15 +58,25 @@ _TYPE_BITS = {
 
 CHECKSUM_FILE = '.md5CheckSums'
 BLOCK_CHECKSUM_FILE = '.md5BlockCheckSums.bz2'
-# a backup is complete when one of these exists (storeBackup >= 3.4.3 / older)
-FINISHED_FLAGS = ('.storeBackupLinks/backup.Finished', '.md5CheckSums.Finished')
+# a backup is complete when this exists; versions up to 3.4.3 instead write
+# NOT_FINISHED_FLAG while running (storeBackupLib.pl:checkIfBackupWasFinished)
+FINISHED_FLAG = '.storeBackupLinks/backup.Finished'
+NOT_FINISHED_FLAG = '.md5CheckSums.notFinished'
 # present until storeBackupUpdateBackup.pl has resolved the links of a
 # backup made with lateLinks
 UNRESOLVED_LINKS = '.storeBackupLinks/linkFile.bz2'
 
 
+# errors of the decompression libraries that are no OSError
+DECOMPRESSION_ERRORS = (EOFError, lzma.LZMAError, zlib.error)
+
+
 class BackupError(Exception):
     """The backup cannot be read."""
+
+
+class ChecksumError(BackupError):
+    """Contents of a stored file differ from the checksum file."""
 
 
 class Entry:
@@ -124,12 +139,27 @@ def parse_info(path):
     return info
 
 
+def parse_version(text):
+    """storeBackup version as tuple, e.g. (3, 5, 2); () if there is none."""
+    m = re.match(r'(\d+(?:\.\d+)*)', text)
+    return tuple(int(n) for n in m.group(1).split('.')) if m else ()
+
+
+def check_relative_path(path, what):
+    """Refuse paths that could point outside the backup directory."""
+    if path.startswith(b'/') or any(
+            part in (b'', b'.', b'..') for part in path.split(b'/')):
+        raise BackupError(f'{what} {path!r} is not a plain relative path')
+
+
 def parse_checksum_line(line):
     """Split one line of the checksum file into its twelve fields.
 
     Returns None for lines that are not entries (comment, malformed).
+    storeBackup separates the fields by exactly one space, so a name may
+    start with white space.
     """
-    fields = line.rstrip(b'\n').split(None, 11)
+    fields = line.rstrip(b'\n').split(b' ', 11)
     if len(fields) != 12 or fields[0].startswith(b'#'):
         return None
     fields[11] = unescape_name(fields[11])
@@ -164,12 +194,9 @@ class Backup:
         if os.path.exists(os.path.join(self.path, UNRESOLVED_LINKS)):
             raise BackupError(f'{self.path} has unresolved lateLinks, run '
                               'storeBackupUpdateBackup.pl first')
-        if not allow_unfinished and not any(
-                os.path.exists(os.path.join(self.path, f))
-                for f in FINISHED_FLAGS):
-            raise BackupError(f'{self.path} was not finished')
-
         self.info = parse_info(info_file)
+        if not allow_unfinished and not self._finished():
+            raise BackupError(f'{self.path} was not finished')
         self.postfix = (self.info.get('postfix') or [''])[0]
         self.uncompress = self.info.get('uncompress') or ['bzip2', '-d']
         self.archive_types = ''.join(self.info.get('archiveTypes') or [])
@@ -177,7 +204,22 @@ class Backup:
         self.root.inode = ROOT_INODE
         self.by_inode = {ROOT_INODE: self.root}
         self.counts = {}
+        self.malformed = 0          # lines of the checksum file skipped
+        # inode -> error of files whose contents are known to be wrong, and
+        # inodes of files read completely with the right checksum
+        self.bad = {}
+        self.verified = set()
         self._load()
+
+    def _finished(self):
+        """Same rule as storeBackup's checkIfBackupWasFinished."""
+        if os.path.exists(os.path.join(self.path, FINISHED_FLAG)):
+            return True
+        version = parse_version((self.info.get('storeBackupVersion')
+                                 or [''])[0])
+        if version > (3, 4, 3):
+            return False
+        return not os.path.exists(os.path.join(self.path, NOT_FINISHED_FLAG))
 
     # -- loading -----------------------------------------------------------
 
@@ -216,11 +258,24 @@ class Backup:
         links = {}
         for line in self._checksum_lines():
             fields = parse_checksum_line(line)
+            if fields is not None:
+                try:
+                    ctime, mtime, atime, size, uid, gid, mode = (
+                        int(f) for f in fields[4:11])
+                except ValueError:
+                    fields = None
             if fields is None:
+                if line.strip() and not line.startswith(b'#'):
+                    self.malformed += 1
+                    if self.malformed <= 5:
+                        log.warning('%s: malformed line in %s: %r',
+                                    self.path, CHECKSUM_FILE, line)
                 continue
-            (md5, compr, dev_inode, _inode_backup, ctime, mtime, atime,
-             size, uid, gid, mode, name) = fields
+            md5, compr, dev_inode, name = fields[0], fields[1], fields[2], \
+                fields[11]
             name = name.strip(b'/')
+            if name:
+                check_relative_path(name, f'{self.path}: name')
             md5 = md5.decode('ascii', 'replace')
             if len(md5) == 32:
                 kind = FILE
@@ -244,10 +299,9 @@ class Backup:
             entry.compr = compr.decode('ascii', 'replace')
             entry.md5 = md5 if kind == FILE else None
             entry.dev_inode = dev_inode
-            entry.ctime, entry.mtime, entry.atime = (
-                int(ctime), int(mtime), int(atime))
-            entry.size = int(size) if kind == FILE else 0
-            entry.uid, entry.gid, entry.mode = int(uid), int(gid), int(mode)
+            entry.ctime, entry.mtime, entry.atime = ctime, mtime, atime
+            entry.size = size if kind == FILE else 0
+            entry.uid, entry.gid, entry.mode = uid, gid, mode
             self.counts[kind] = self.counts.get(kind, 0) + 1
 
             if entry is self.root:
@@ -264,6 +318,9 @@ class Backup:
             entry.inode = stable_inode(key, used)
             self.by_inode[entry.inode] = entry
 
+        if self.malformed:
+            log.warning('%s: %d malformed lines in %s skipped', self.path,
+                        self.malformed, CHECKSUM_FILE)
         self._finish_dirs(self.root, used)
         for entry in self.walk():
             if entry.kind == FILE:
@@ -337,36 +394,55 @@ class Backup:
             stat.S_ISCHR(st.st_mode) else 0
 
     def open(self, entry, verify=True):
-        """Reader for the contents of a regular file."""
+        """Reader for the contents of a regular file.
+
+        With ``verify``, files found damaged before are refused, and the
+        returned reader checks the contents (see :class:`VerifyingReader`).
+        """
         if entry.kind != FILE:
             raise BackupError(f'{entry.path!r} is no regular file')
+        if verify and entry.inode in self.bad:
+            raise ChecksumError(self.bad[entry.inode])
         path = self.stored_path(entry)
-        if entry.compr == 'u':
-            reader = PlainReader(path, entry.size)
-        elif entry.compr == 'c':
-            reader = StreamReader(lambda: self._decompressed(path),
-                                  entry.size)
-        elif entry.compr == 'b':
-            reader = BlockReader(self, path, entry.size)
-        else:
-            raise BackupError(f'{entry.path!r}: unknown compr flag '
-                              f'{entry.compr!r}')
-        return VerifyingReader(reader, entry) if verify else reader
+        try:
+            if entry.compr == 'u':
+                reader = PlainReader(path, entry.size)
+            elif entry.compr == 'c':
+                reader = StreamReader(lambda: self._decompressed(path),
+                                      entry.size)
+            elif entry.compr == 'b':
+                reader = BlockReader(self, path, entry.size, verify=verify)
+            else:
+                raise BackupError(f'{entry.path!r}: unknown compr flag '
+                                  f'{entry.compr!r}')
+        except ChecksumError as e:
+            if verify:
+                self.mark_bad(entry, f'{entry.path!r}: {e}')
+            raise
+        return VerifyingReader(reader, entry, self) if verify else reader
+
+    def mark_bad(self, entry, error):
+        self.bad.setdefault(entry.inode, error)
+        self.verified.discard(entry.inode)
 
     def decompress_file(self, path):
         """Whole decompressed contents of ``path`` (one call into the
         library, which releases the GIL; much faster than reading a stream)."""
         prog = os.path.basename(self.uncompress[0])
         with open(path, 'rb') as f:
-            data = f.read()
-        if prog in ('bzip2', 'bunzip2', 'lbzip2', 'pbzip2'):
-            return bz2.decompress(data)
-        if prog in ('gzip', 'gunzip', 'pigz'):
-            return gzip.decompress(data)
-        if prog in ('xz', 'unxz', 'lzma', 'unlzma'):
-            return lzma.decompress(data)
-        with self._decompressed(path) as f:
-            return f.read()
+            if prog in ('bzip2', 'bunzip2', 'lbzip2', 'pbzip2'):
+                return bz2.decompress(f.read())
+            if prog in ('gzip', 'gunzip', 'pigz'):
+                return gzip.decompress(f.read())
+            if prog in ('xz', 'unxz', 'lzma', 'unlzma'):
+                return lzma.decompress(f.read())
+            proc = subprocess.run(self.uncompress, stdin=f,
+                                  stdout=subprocess.PIPE,
+                                  stderr=subprocess.DEVNULL)
+        if proc.returncode:
+            raise BackupError(f'{shlex.join(self.uncompress)} failed with '
+                              f'status {proc.returncode} on {path!r}')
+        return proc.stdout
 
     def _decompressed(self, path):
         """Binary stream of the decompressed contents of ``path``."""
@@ -381,25 +457,66 @@ class Backup:
 
 
 # -- readers ---------------------------------------------------------------
+#
+# The kernel sends the reads of one open file in parallel; ``read`` may be
+# called from several threads at once and serializes on ``lock``.
+# ``read_nowait`` is for the event loop: it returns None instead of waiting
+# for the lock or for data that is not at hand.
 
-class PlainReader:
+class Reader:
+
+    def __init__(self):
+        self.lock = threading.Lock()
+
+    def read(self, offset, length):
+        with self.lock:
+            return self._read(offset, length)
+
+    def read_nowait(self, offset, length):
+        if not self.lock.acquire(blocking=False):
+            return None
+        try:
+            if not self._ready(offset, length):
+                return None
+            return self._read(offset, length)
+        finally:
+            self.lock.release()
+
+    def close(self):
+        with self.lock:
+            self._close()
+
+    def _ready(self, offset, length):
+        return False
+
+    def _close(self):
+        pass
+
+
+class PlainReader(Reader):
     """File stored without compression."""
 
     def __init__(self, path, size):
+        super().__init__()
         self.size = size
-        self.fd = os.open(path, os.O_RDONLY)
+        self.fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW)
+        stored = os.fstat(self.fd).st_size
+        if stored != size:
+            os.close(self.fd)
+            raise ChecksumError(f'stored file has {stored} bytes, the '
+                                f'checksum file says {size}')
 
-    def ready(self, offset, length):
+    def _ready(self, offset, length):
         return True
 
-    def read(self, offset, length):
+    def _read(self, offset, length):
         return os.pread(self.fd, length, offset)
 
-    def close(self):
+    def _close(self):
         os.close(self.fd)
 
 
-class StreamReader:
+class StreamReader(Reader):
     """Random access on top of a decompressing stream.
 
     Sequential reads (the normal case for backup programs) cost one pass;
@@ -409,82 +526,109 @@ class StreamReader:
     CHUNK = 1 << 20
 
     def __init__(self, open_stream, size):
+        super().__init__()
         self.open_stream = open_stream
         self.size = size
         self.stream = None
         self.pos = 0
 
-    def ready(self, offset, length):
+    def _ready(self, offset, length):
         """True if the read continues where the last one ended."""
         return self.stream is not None and offset == self.pos
 
-    def read(self, offset, length):
+    def _read(self, offset, length):
+        length = min(length, self.size - offset)
+        if length <= 0:
+            return b''
         if self.stream is None or offset < self.pos:
-            self._close_stream()
+            self._close()
             self.stream = self.open_stream()
             self.pos = 0
         while self.pos < offset:
             skipped = self.stream.read(min(self.CHUNK, offset - self.pos))
             if not skipped:
-                return b''
+                break
             self.pos += len(skipped)
-        data = self.stream.read(length)
+        data = self.stream.read(length) if self.pos == offset else b''
         self.pos += len(data)
+        if len(data) < length:
+            raise ChecksumError(f'stored file ends after {self.pos} '
+                                f'bytes, the checksum file says {self.size}')
         return data
 
-    def _close_stream(self):
+    def _close(self):
         if self.stream is not None:
             self.stream.close()
             self.stream = None
 
-    def close(self):
-        self._close_stream()
 
-
-class BlockReader:
+class BlockReader(Reader):
     """File stored by checkBlocks: a directory with the file's blocks.
 
     ``.md5BlockCheckSums.bz2`` in that directory lists ``md5 compr entry``
     per block, ``entry`` relative to the backup root.  All blocks have the
     size of the first one, except the last.  The blocks following the one
-    being read are decompressed in parallel (bz2 releases the GIL).
+    being read are decompressed in parallel (bz2 releases the GIL).  With
+    ``verify``, each block is checked against its MD5 when it is loaded,
+    independent of the order of the reads.
     """
 
-    def __init__(self, backup, path, size, prefetch=4):
+    def __init__(self, backup, path, size, verify=True, prefetch=4):
+        super().__init__()
         self.backup = backup
+        self.path = path
         self.size = size
+        self.verify = verify
         self.blocks = []
         with bz2.open(os.path.join(path, os.fsencode(BLOCK_CHECKSUM_FILE)),
                       'rb') as f:
             for line in f:
-                parts = line.rstrip(b'\n').split(None, 2)
+                parts = line.rstrip(b'\n').split(b' ', 2)
                 if len(parts) != 3:
                     raise BackupError(f'{path!r}: bad line {line!r} in '
                                       f'{BLOCK_CHECKSUM_FILE}')
-                self.blocks.append((parts[1].decode('ascii', 'replace'),
+                check_relative_path(parts[2], f'{path!r}: block')
+                self.blocks.append((parts[0].decode('ascii', 'replace'),
+                                    parts[1].decode('ascii', 'replace'),
                                     parts[2]))
         self.prefetch = prefetch
         self.pool = None
         self.pending = {}           # block index -> Future
         self.cache_index = None
         self.cache_data = b''
-        self.block_size = len(self._block(0)) if self.blocks else 0
-        if self.size and not self.block_size:
-            raise BackupError(f'{path!r}: first block is empty')
+        self.block_size = 0
+        try:
+            self.block_size = len(self._block(0)) if self.blocks else 0
+            if self.size and not self.block_size:
+                raise BackupError(f'{path!r}: first block is empty')
+        except BaseException:
+            self._close()
+            raise
 
     def _load(self, index):
-        compr, entry = self.blocks[index]
+        """Contents of one block; runs in the prefetch threads."""
+        md5, compr, entry = self.blocks[index]
         path = os.path.join(os.fsencode(self.backup.path), entry)
         if compr == 'c':
-            return self.backup.decompress_file(path)
-        with open(path, 'rb') as f:
-            return f.read()
+            data = self.backup.decompress_file(path)
+        else:
+            with open(path, 'rb') as f:
+                data = f.read()
+        if self.verify and hashlib.md5(data).hexdigest() != md5:
+            raise ChecksumError(f'block {entry!r} does not match '
+                                f'{BLOCK_CHECKSUM_FILE}')
+        return data
 
     def _block(self, index):
         if index == self.cache_index:
             return self.cache_data
         future = self.pending.pop(index, None)
         data = future.result() if future else self._load(index)
+        if self.block_size and index < len(self.blocks) - 1 and \
+                len(data) != self.block_size:
+            raise BackupError(f'{self.path!r}: block {index} has '
+                              f'{len(data)} bytes instead of '
+                              f'{self.block_size}')
         for i in [i for i in self.pending if i < index]:
             self.pending.pop(i).cancel()
         if self.prefetch:
@@ -498,7 +642,7 @@ class BlockReader:
         self.cache_index, self.cache_data = index, data
         return data
 
-    def ready(self, offset, length):
+    def _ready(self, offset, length):
         """True if the blocks for this read are decompressed already."""
         end = min(offset + length, self.size)
         if offset >= end:
@@ -511,21 +655,31 @@ class BlockReader:
                     return False
         return True
 
-    def read(self, offset, length):
+    def _read(self, offset, length):
         out = []
         end = min(offset + length, self.size)
         while offset < end:
             index, start = divmod(offset, self.block_size)
             if index >= len(self.blocks):
-                raise BackupError('block list shorter than the file')
+                break               # fewer blocks than the size says
             data = self._block(index)[start:start + end - offset]
             if not data:
-                raise BackupError(f'block {index} is too short')
+                if index < len(self.blocks) - 1:
+                    raise BackupError(f'{self.path!r}: block {index} is '
+                                      'too short')
+                break
             out.append(data)
             offset += len(data)
         return b''.join(out)
 
-    def close(self):
+    def stored_size(self):
+        """Size of all blocks together."""
+        if not self.blocks:
+            return 0
+        last = len(self.blocks) - 1
+        return last * self.block_size + len(self._load(last))
+
+    def _close(self):
         for future in self.pending.values():
             future.cancel()
         self.pending = {}
@@ -534,69 +688,133 @@ class BlockReader:
         self.cache_data = b''
 
 
-class VerifyingReader:
-    """Checks the MD5 of the checksum file while a file is read in order.
+class VerifyingReader(Reader):
+    """Checks the size and MD5 that the checksum file records for a file.
 
-    A wrong size or MD5 raises :class:`ChecksumError` on the read that
-    reaches the end of the file and on every read after it (the kernel
-    retries failed reads).  Reads that are not in sequence disable the
-    check for this open file.
+    The check runs when the file is read completely, in any order: data read
+    ahead of a gap is kept until the gap is filled (up to ``MAX_AHEAD``
+    bytes; files read in a more scattered way are not checked).  A mismatch
+    raises :class:`ChecksumError` on the read that completes the file and on
+    every later read, and is recorded in ``backup.bad`` so that the file
+    cannot be opened again; a match is recorded in ``backup.verified``.
     """
 
-    def __init__(self, reader, entry):
+    MAX_AHEAD = 64 << 20
+
+    def __init__(self, reader, entry, backup):
+        super().__init__()
         self.reader = reader
         self.entry = entry
+        self.backup = backup
         self.size = reader.size
         self.md5 = hashlib.md5()
-        self.pos = 0
-        self.verified = False
+        self.pos = 0                # contents up to here are hashed
+        self.ahead = {}             # offset -> data read beyond pos
+        self.ahead_bytes = 0
+        self.done = entry.inode in backup.verified
         self.error = None
-        self.lock = threading.Lock()
-
-    def ready(self, offset, length):
-        return self.reader.ready(offset, length)
 
     def read(self, offset, length):
         with self.lock:
-            if self.error:
-                raise ChecksumError(self.error)
-            data = self.reader.read(offset, length)
-            if self.verified or self.md5 is None:
-                return data
-            if offset != self.pos:
-                self.md5 = None
-                return data
-            self.md5.update(data)
-            self.pos += len(data)
-            if self.pos >= self.size or not data:
-                self.verified = True
-                if self.pos != self.size or \
-                        self.md5.hexdigest() != self.entry.md5:
-                    self.error = (f'{self.entry.path!r}: contents do not '
-                                  f'match the checksum file (size '
-                                  f'{self.pos}/{self.size})')
-                    raise ChecksumError(self.error)
-            return data
+            return self._checked(offset, self.reader.read, length)
 
-    def close(self):
+    def read_nowait(self, offset, length):
+        if not self.lock.acquire(blocking=False):
+            return None
+        try:
+            return self._checked(offset, self.reader.read_nowait, length)
+        finally:
+            self.lock.release()
+
+    def _checked(self, offset, read, length):
+        if self.error:
+            raise ChecksumError(self.error)
+        try:
+            data = read(offset, length)
+        except ChecksumError as e:
+            self._fail(f'{self.entry.path!r}: {e}')
+        if data is not None and not self.done:
+            self._account(offset, data)
+        return data
+
+    def _account(self, offset, data):
+        if offset > self.pos:
+            if self.ahead_bytes + len(data) > self.MAX_AHEAD:
+                log.warning('%r read too far out of order, not checked',
+                            self.entry.path)
+                self.done = True
+                self.ahead = {}
+                return
+            if len(data) > len(self.ahead.get(offset, b'')):
+                self.ahead_bytes += len(data) - len(self.ahead.get(offset,
+                                                                    b''))
+                self.ahead[offset] = data
+        else:
+            self._hash(offset, data)
+        while self.ahead:
+            ready = [o for o in self.ahead if o <= self.pos]
+            if not ready:
+                break
+            for o in ready:
+                chunk = self.ahead.pop(o)
+                self.ahead_bytes -= len(chunk)
+                self._hash(o, chunk)
+        if self.pos >= self.size or (not data and offset == self.pos):
+            self._finish()
+
+    def _hash(self, offset, data):
+        if offset + len(data) > self.pos:
+            self.md5.update(data[self.pos - offset:])
+            self.pos = offset + len(data)
+
+    def _finish(self):
+        self.done = True
+        self.ahead = {}
+        if self.pos == self.size and self.md5.hexdigest() == self.entry.md5:
+            self.backup.verified.add(self.entry.inode)
+            return
+        stored_size = getattr(self.reader, 'stored_size', None)
+        if stored_size is not None:
+            # storeBackup records the size of a file in blocks from before
+            # reading it, but the MD5 of what it read (storeBackup.pl warns
+            # "changed during backup"); the blocks themselves are checked
+            stored = stored_size()
+            if stored != self.size:
+                log.warning('%r changed while storeBackup read it: '
+                            '%d bytes recorded, %d stored; shown with the '
+                            'recorded size', self.entry.path, self.size,
+                            stored)
+                return
+        self._fail(f'{self.entry.path!r}: contents do not match the '
+                   f'checksum file (size {self.pos}/{self.size})')
+
+    def _fail(self, error):
+        self.done = True
+        self.ahead = {}
+        self.error = error
+        self.backup.mark_bad(self.entry, error)
+        raise ChecksumError(error)
+
+    def _close(self):
         self.reader.close()
-
-
-class ChecksumError(BackupError):
-    """Contents of a stored file differ from the checksum file."""
 
 
 class _ProcessStream:
     """Decompression by an external program (uncompress= of the backup)."""
 
     def __init__(self, command, path):
+        self.command = command
         self.file = open(path, 'rb')
         self.proc = subprocess.Popen(command, stdin=self.file,
                                      stdout=subprocess.PIPE,
                                      stderr=subprocess.DEVNULL)
 
-    def read(self, n):
-        return self.proc.stdout.read(n)
+    def read(self, n=-1):
+        data = self.proc.stdout.read(n)
+        if n and (n < 0 or not data) and self.proc.wait():
+            raise BackupError(f'{shlex.join(self.command)} failed with '
+                              f'status {self.proc.returncode}')
+        return data
 
     def close(self):
         self.proc.stdout.close()

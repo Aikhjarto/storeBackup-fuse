@@ -1,14 +1,20 @@
 # SPDX-License-Identifier: GPL-2.0-or-later
 # Copyright (C) 2026 Thomas Wagner
+import bz2
+import concurrent.futures
+import gzip
 import hashlib
+import io
 import os
+import random
 import stat
 
 import pytest
 
 from storebackup_fuse.backup import (
     DIR, FILE, FIFO, SOCKET, SYMLINK, Backup, BackupError, ChecksumError,
-    StreamReader, parse_checksum_line, parse_info, unescape_name)
+    StreamReader, parse_checksum_line, parse_info, parse_version,
+    unescape_name)
 
 
 def read_all(backup, entry, step=65536, verify=True):
@@ -42,9 +48,21 @@ def test_parse_checksum_line_keeps_spaces_in_names():
     assert fields[11] == b'dir/a  b c'
 
 
+def test_parse_checksum_line_keeps_leading_white_space():
+    line = (b'0cc175b9c0f1b6a831c399e269772661 u 47-1 2 3 4 5 1 0 0 420 '
+            b' \tname\n')
+    assert parse_checksum_line(line)[11] == b' \tname'
+
+
 def test_parse_checksum_line_skips_comments_and_garbage():
     assert parse_checksum_line(b'# contents/md5 compr dev-inode\n') is None
     assert parse_checksum_line(b'too few fields\n') is None
+
+
+def test_parse_version():
+    assert parse_version('3.5.2') == (3, 5, 2)
+    assert parse_version('3.4.3') == (3, 4, 3) < (3, 4, 3, 1)
+    assert parse_version('') == ()
 
 
 def test_parse_info(tmp_path):
@@ -95,10 +113,51 @@ def test_special_names(synthetic):
     sb.file(b'back\\slash', b'2')
     sb.file(b'with space', b'3')
     sb.file(b'latin1-\xe4', b'4')
+    sb.file(b' lead', b'5')
+    sb.file(b'\ttab', b'6')
+    sb.blocked(b' big.img', b'7' * 1000, block_size=256)
     b = Backup(sb.write())
-    assert sorted(b.root.children) == [b'back\\slash', b'latin1-\xe4',
+    assert sorted(b.root.children) == [b'\ttab', b' big.img', b' lead',
+                                       b'back\\slash', b'latin1-\xe4',
                                        b'new\nline', b'with space']
     assert read_all(b, b.lookup(b'new\nline')) == b'1'
+    assert read_all(b, b.lookup(b' lead')) == b'5'
+    assert read_all(b, b.lookup(b'\ttab')) == b'6'
+    assert read_all(b, b.lookup(b' big.img')) == b'7' * 1000
+
+
+@pytest.mark.parametrize('name', [b'../x', b'a/../x', b'a/./x', b'a//x'])
+def test_names_leaving_the_backup_refused(synthetic, name):
+    sb = synthetic()
+    sb.raw_line(b'0cc175b9c0f1b6a831c399e269772661 u 1-1 0 1 1 1 1 0 0 '
+                b'420 ' + name + b'\n')
+    with pytest.raises(BackupError, match='not a plain relative path'):
+        Backup(sb.write())
+
+
+@pytest.mark.parametrize('block', [b'/etc/passwd', b'../../etc/passwd'])
+def test_block_paths_leaving_the_backup_refused(synthetic, block):
+    sb = synthetic()
+    sb.blocked(b'disk.img', b'data', block_size=65536)
+    with bz2.open(os.path.join(sb.path, 'disk.img',
+                               '.md5BlockCheckSums.bz2'), 'wb') as f:
+        f.write(b'%s u %s\n' % (hashlib.md5(b'data').hexdigest().encode(),
+                                block))
+    b = Backup(sb.write())
+    with pytest.raises(BackupError, match='not a plain relative path'):
+        b.open(b.lookup('disk.img'))
+
+
+def test_malformed_lines_counted(synthetic, caplog):
+    sb = synthetic()
+    sb.file(b'f', b'x')
+    sb.raw_line(b'garbage\n')
+    sb.raw_line(b'0cc175b9c0f1b6a831c399e269772661 u 1-1 0 x 1 1 1 0 0 420 '
+                b'g\n')
+    b = Backup(sb.write())
+    assert b.malformed == 2
+    assert '2 malformed lines' in caplog.text
+    assert list(b.root.children) == [b'f']
 
 
 def test_implicit_parent_directories(synthetic):
@@ -149,8 +208,122 @@ def test_blocked_file_uncompressed_blocks(synthetic):
     assert read_all(b, b.lookup('raw.bin'), step=4096) == data
 
 
+@pytest.mark.parametrize('compress', [True, False])
+def test_blocked_file_damaged_block(synthetic, compress):
+    """Each block is checked when it is loaded, whatever the read order."""
+    data = os.urandom(5 * 65536)
+    sb = synthetic()
+    blocks = sb.blocked(b'disk.img', data, block_size=65536,
+                        compress=compress)
+    b = Backup(sb.write())
+    with open(blocks[3], 'wb') as f:
+        bad = bytearray(data[3 * 65536:4 * 65536])
+        bad[100] ^= 1
+        f.write(bz2.compress(bad) if compress else bad)
+    entry = b.lookup('disk.img')
+    reader = b.open(entry)
+    assert reader.read(0, 100) == data[:100]
+    with pytest.raises(ChecksumError, match='does not match'):
+        reader.read(3 * 65536 + 10, 100)          # skipped blocks 1 and 2
+    reader.close()
+    assert entry.inode in b.bad
+    reader = b.open(entry, verify=False)
+    assert reader.read(3 * 65536 + 100, 1) != data[3 * 65536 + 100:][:1]
+    reader.close()
+
+
+def test_blocked_file_with_wrong_md5(synthetic):
+    data = os.urandom(3 * 65536)
+    sb = synthetic()
+    sb.blocked(b'disk.img', data, block_size=65536, md5='0' * 32)
+    b = Backup(sb.write())
+    with pytest.raises(ChecksumError, match='do not match'):
+        read_all(b, b.lookup('disk.img'))
+
+
+@pytest.mark.parametrize('stored', [3 * 65536 + 500, 2 * 65536 + 500])
+def test_blocked_file_changed_during_backup(synthetic, caplog, stored):
+    """storeBackup records the size from before reading a file in blocks
+    and the MD5 of what it read; such a file is shown with the recorded
+    size, not reported as damaged."""
+    data = os.urandom(stored)
+    recorded = 3 * 65536 - 1000
+    sb = synthetic()
+    sb.blocked(b'grew.img', data, block_size=65536, size=recorded)
+    b = Backup(sb.write())
+    entry = b.lookup('grew.img')
+    assert entry.size == recorded
+    assert read_all(b, entry) == data[:recorded]
+    assert 'changed while storeBackup read it' in caplog.text
+    assert entry.inode not in b.bad
+
+
+def test_blocked_file_block_of_wrong_length(synthetic):
+    data = os.urandom(3 * 65536)
+    sb = synthetic()
+    blocks = sb.blocked(b'disk.img', data, block_size=65536,
+                        compress=False)
+    b = Backup(sb.write())
+    with open(blocks[1], 'ab') as f:
+        f.write(b'x')
+    reader = b.open(b.lookup('disk.img'), verify=False)
+    with pytest.raises(BackupError, match='65537 bytes instead of 65536'):
+        reader.read(65536, 10)
+    reader.close()
+
+
+@pytest.mark.parametrize('name', [b'disk.img', b'c.txt'])
+def test_parallel_reads_on_one_reader(synthetic, name):
+    data = os.urandom(20 * 16384)
+    sb = synthetic()
+    sb.blocked(b'disk.img', data, block_size=16384)
+    sb.file(b'c.txt', data, compr='c')
+    b = Backup(sb.write())
+    reader = b.open(b.lookup(name), verify=False)
+    offsets = [random.Random(i).randrange(len(data)) for i in range(400)]
+    with concurrent.futures.ThreadPoolExecutor(8) as pool:
+        results = pool.map(lambda o: (o, reader.read(o, 5000)), offsets)
+        for off, got in results:
+            assert got == data[off:off + 5000], off
+    reader.close()
+
+
+def test_external_uncompress(synthetic):
+    """An uncompress= program without a built-in equivalent, e.g. zstd."""
+    data = os.urandom(3 * 65536 + 7)
+    sb = synthetic(uncompress="'sh' '-c' 'bzip2 -d'")
+    sb.blocked(b'disk.img', data, block_size=65536)
+    sb.file(b'c.txt', data, compr='c')
+    b = Backup(sb.write())
+    assert read_all(b, b.lookup('disk.img')) == data
+    assert read_all(b, b.lookup('c.txt')) == data
+
+
+def test_external_uncompress_failing(synthetic):
+    sb = synthetic(uncompress="'sh' '-c' 'cat >/dev/null; exit 3'")
+    sb.blocked(b'disk.img', b'data', block_size=65536)
+    sb.file(b'c.txt', b'data', compr='c')
+    b = Backup(sb.write())
+    for name in ('disk.img', 'c.txt'):
+        with pytest.raises(BackupError, match='status 3'):
+            read_all(b, b.lookup(name), verify=False)
+
+
+def test_damaged_gzip_file(synthetic):
+    sb = synthetic(uncompress="'gzip' '-d'")
+    sb.file(b'c.txt', b'x' * 100000, compr='c', compress=gzip.compress)
+    b = Backup(sb.write())
+    assert read_all(b, b.lookup('c.txt')) == b'x' * 100000
+    path = os.path.join(sb.path, 'c.txt.bz2')
+    with open(path, 'r+b') as f:
+        f.seek(20)
+        f.write(b'\xff' * 20)
+    with pytest.raises(Exception) as e:
+        read_all(b, b.lookup('c.txt'), verify=False)
+    assert not isinstance(e.value, AssertionError)
+
+
 def test_stream_reader_restarts_for_backward_reads():
-    import io
     opened = []
 
     def opener():
@@ -163,6 +336,13 @@ def test_stream_reader_restarts_for_backward_reads():
     assert r.read(0, 2) == b'01'
     assert len(opened) == 2
     assert r.read(20, 2) == b''
+
+
+def test_stream_reader_detects_early_end():
+    r = StreamReader(lambda: io.BytesIO(b'0123'), 10)
+    assert r.read(0, 4) == b'0123'
+    with pytest.raises(ChecksumError, match='ends after 4 bytes'):
+        r.read(4, 4)
 
 
 def test_verify_detects_corruption(synthetic):
@@ -188,17 +368,74 @@ def test_verify_detects_wrong_size(synthetic):
         read_all(b, b.lookup('f'))
 
 
-def test_verify_is_skipped_for_out_of_order_reads(synthetic):
+def test_verify_out_of_order_reads(synthetic):
+    """The kernel sends parallel reads, which may arrive in any order."""
+    data = os.urandom(100000)
     sb = synthetic()
-    sb.file(b'f', b'abcdef')
+    sb.file(b'good', data)
+    sb.file(b'bad', data)
+    b = Backup(sb.write())
+    with open(os.path.join(sb.path, 'bad'), 'r+b') as f:
+        f.seek(50000)
+        f.write(b'X')
+    offsets = list(range(0, len(data), 4096))
+    random.Random(1).shuffle(offsets)
+    for name in ('good', 'bad'):
+        reader = b.open(b.lookup(name))
+        try:
+            for off in offsets[:-1]:
+                reader.read(off, 4096)
+                reader.read(off, 100)           # repeated read
+            if name == 'bad':
+                with pytest.raises(ChecksumError):
+                    reader.read(offsets[-1], 4096)
+            else:
+                reader.read(offsets[-1], 4096)
+        finally:
+            reader.close()
+    assert b.lookup('good').inode in b.verified
+    assert b.lookup('bad').inode in b.bad
+
+
+def test_verify_gives_up_on_scattered_reads(synthetic, monkeypatch):
+    from storebackup_fuse.backup import VerifyingReader
+    monkeypatch.setattr(VerifyingReader, 'MAX_AHEAD', 10)
+    sb = synthetic()
+    sb.file(b'f', b'abcdefghijklmnopqrstuvwxyz')
     b = Backup(sb.write())
     with open(os.path.join(sb.path, 'f'), 'wb') as f:
-        f.write(b'ABCDEF')
+        f.write(b'ABCDEFGHIJKLMNOPQRSTUVWXYZ')
     reader = b.open(b.lookup('f'))
-    assert reader.read(3, 3) == b'DEF'                 # not from the start
-    assert reader.read(0, 3) == b'ABC'
-    assert reader.read(3, 3) == b'DEF'
+    assert reader.read(10, 8) == b'KLMNOPQR'
+    assert reader.read(20, 6) == b'UVWXYZ'      # beyond MAX_AHEAD: no check
+    assert reader.read(0, 26) == b'ABCDEFGHIJKLMNOPQRSTUVWXYZ'
     reader.close()
+    assert not b.bad and not b.verified
+
+
+def test_damaged_file_cannot_be_opened_again(synthetic):
+    sb = synthetic()
+    sb.file(b'a', b'same data', dev_inode='9-9')
+    sb.file(b'b', b'same data', dev_inode='9-9')      # hard link of a
+    b = Backup(sb.write())
+    with open(os.path.join(sb.path, 'a'), 'wb') as f:
+        f.write(b'SAME DATA')
+    with pytest.raises(ChecksumError):
+        read_all(b, b.lookup('a'))
+    for name in ('a', 'b'):
+        with pytest.raises(ChecksumError, match='do not match'):
+            b.open(b.lookup(name))
+    assert read_all(b, b.lookup('b'), verify=False) == b'same data'
+
+
+def test_stored_file_of_wrong_size(synthetic):
+    sb = synthetic()
+    sb.file(b'f', b'12345')
+    b = Backup(sb.write())
+    with open(os.path.join(sb.path, 'f'), 'wb') as f:
+        f.write(b'123')
+    with pytest.raises(ChecksumError, match='3 bytes'):
+        b.open(b.lookup('f'), verify=False)
 
 
 def test_empty_file(synthetic):
@@ -246,6 +483,19 @@ def test_unfinished_backup_refused(synthetic):
     with pytest.raises(BackupError, match='not finished'):
         Backup(path)
     assert Backup(path, allow_unfinished=True).lookup('f').size == 1
+
+
+@pytest.mark.parametrize('version', [None, '3.2', '3.4.3'])
+def test_old_backups_finished_without_flag(synthetic, version):
+    """Up to storeBackup 3.4.3, a backup is unfinished while
+    .md5CheckSums.notFinished exists (checkIfBackupWasFinished)."""
+    sb = synthetic(finished=False, version=version)
+    sb.file(b'f', b'x')
+    path = sb.write()
+    assert Backup(path).lookup('f').size == 1
+    open(os.path.join(path, '.md5CheckSums.notFinished'), 'w').close()
+    with pytest.raises(BackupError, match='not finished'):
+        Backup(path)
 
 
 def test_unresolved_late_links_refused(synthetic):
