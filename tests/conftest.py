@@ -229,7 +229,14 @@ def storebackup_late_links(tmp_path_factory):
                              'lateCompress=yes\n')
     unresolved = os.path.exists(os.path.join(
         backup, '.storeBackupLinks', 'linkFile.bz2'))
+    # own lock file: the default one is shared with real storeBackup runs,
+    # and the program exits with 0 if it is taken
     subprocess.run([shutil.which('storeBackupUpdateBackup.pl'), '-b',
-                    os.path.join(tmp, 'backups')], check=True,
+                    os.path.join(tmp, 'backups'), '-L',
+                    os.path.join(tmp, 'update.lock')], check=True,
                    stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    assert not os.path.exists(os.path.join(
+        backup, '.storeBackupLinks', 'linkFile.bz2')), \
+        'storeBackupUpdateBackup.pl did not resolve the lateLinks'
+
     return {'backup': backup, 'src': src, 'was_unresolved': unresolved}

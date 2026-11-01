@@ -43,9 +43,8 @@ class StoreBackupFS(pyfuse3.Operations):
         self.handles = {}
         self.dir_handles = {}       # fh -> [inode, sorted names or None]
         self.next_fh = itertools.count(1)
-        # inode -> number of open handles that use the page cache, for files
-        # not verified yet
-        self.cached_readers = {}
+        # files not verified yet with an open handle that uses the page cache
+        self.cached_inodes = set()
         self.link_sizes = {}
         self.rdevs = {}
 
@@ -187,10 +186,10 @@ class StoreBackupFS(pyfuse3.Operations):
         # all reads of the file itself.  One reader may use the page cache
         # (dropping pages left by earlier incomplete reads); others read
         # directly while it is open.
-        if self.cached_readers.get(entry.inode):
+        if entry.inode in self.cached_inodes:
             self.handles[fh] = (entry, reader, False)
             return pyfuse3.FileInfo(fh=fh, direct_io=True)
-        self.cached_readers[entry.inode] = 1
+        self.cached_inodes.add(entry.inode)
         self.handles[fh] = (entry, reader, True)
         return pyfuse3.FileInfo(fh=fh, keep_cache=False)
 
@@ -206,7 +205,7 @@ class StoreBackupFS(pyfuse3.Operations):
                 data = await trio.to_thread.run_sync(reader.read, off, size)
             return data
         except ChecksumError as e:
-            log.error('%s', e)
+            log.error('read %r at %d: %s', entry.path, off, e)
             self._invalidate(entry.inode)
             raise pyfuse3.FUSEError(errno.EIO) from None
         except (OSError, BackupError) + DECOMPRESSION_ERRORS as e:
@@ -231,7 +230,7 @@ class StoreBackupFS(pyfuse3.Operations):
         if handle is not None:
             entry, reader, cached = handle
             if cached:
-                del self.cached_readers[entry.inode]
+                self.cached_inodes.discard(entry.inode)
             await trio.to_thread.run_sync(reader.close)
 
 

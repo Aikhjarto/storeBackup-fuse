@@ -77,7 +77,8 @@ cannot be opened, also with `--no-verify`.
 storeBackup records the size of a file in blocks from before reading it but
 the MD5 of what it read. If the file changed meanwhile (storeBackup logs
 "changed during backup"), it is checked against the MD5 of all stored
-blocks, shown with the recorded size (cut off, or filled up with zeros like
+blocks (only the blocks at the end are read a second time), shown with
+the recorded size (cut off, or filled up with zeros like
 `storeBackupRecover.pl` does), and a warning is logged. Unlike
 `storeBackupRecover.pl`, which writes all stored blocks, a file that grew is
 cut off at the recorded size.
@@ -88,8 +89,11 @@ cut off at the recorded size.
 Python's own modules; files are decompressed by worker threads ahead of the
 reads, several files in parallel. Any other `uncompress=` program from
 `.md5CheckSums.info` (e.g. `zstd`) is run, with the rights of the caller,
-only if the info file belongs to root or the caller and is not writable by
-others, or with `--allow-external-uncompress`.
+only if the info file belongs to root or the caller, is not writable by
+others and is no symbolic link, or with `--allow-external-uncompress`.
+Only the file itself is checked, not the directories leading to it: with
+an external program, mount only backups below directories that other
+users cannot change.
 
 ### Inode numbers
 

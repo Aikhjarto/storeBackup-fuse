@@ -34,6 +34,7 @@ import shlex
 import stat
 import subprocess
 import threading
+import time
 import zlib
 
 log = logging.getLogger(__name__)
@@ -78,6 +79,26 @@ for _names, _module in ((('bzip2', 'bunzip2', 'lbzip2', 'pbzip2'), bz2),
 
 # errors of the decompression libraries that are no OSError
 DECOMPRESSION_ERRORS = (EOFError, lzma.LZMAError, zlib.error)
+
+
+def is_data_error(e):
+    """True if ``e`` from a decompression library means damaged data, not
+    a failed read or a programming error: bz2 and gzip raise OSError
+    without errno ("Invalid data stream", BadGzipFile), bz2.decompress
+    ValueError for data cut off."""
+    if isinstance(e, DECOMPRESSION_ERRORS):
+        return True
+    if isinstance(e, ValueError):
+        return 'end-of-stream marker' in str(e)
+    return isinstance(e, OSError) and e.errno is None
+
+
+def program_failed(command, status, path=None):
+    """Error for an uncompress program that failed.  Not taken as damage:
+    the exit status does not tell damaged data from other failures."""
+    where = f' on {path!r}' if path is not None else ''
+    return BackupError(f'{shlex.join(command)} failed with status '
+                       f'{status}{where}')
 
 
 class BackupError(Exception):
@@ -128,23 +149,36 @@ def unescape_name(name):
     return name.replace(b'\\0A', b'\n').replace(b'\\5C', b'\\')
 
 
-def parse_info(path):
-    """Parse ``.md5CheckSums.info`` into a dict of key -> list of words.
+def read_info(path):
+    """Parse ``.md5CheckSums.info`` into a dict of key -> list of words,
+    and return it with the stat of the file that was read (not of its
+    name, which may change meanwhile).  It must be a regular file.
 
     Values are written by storeBackup as shell-like quoted words, e.g.
     ``uncompress='bzip2' '-d'``.
     """
+    try:
+        fd = os.open(path, os.O_RDONLY | os.O_NONBLOCK)
+    except OSError as e:
+        raise BackupError(f'{path}: {e.strerror}') from None
+    with open(fd, 'rb') as f:
+        st = os.fstat(fd)
+        if not stat.S_ISREG(st.st_mode):
+            raise BackupError(f'{path} is not a regular file')
+        return _parse_info_file(f), st
+
+
+def _parse_info_file(f):
     info = {}
-    with open(path, 'rb') as f:
-        for raw in f:
-            line = raw.decode('utf-8', 'surrogateescape').rstrip('\n')
-            if '=' not in line or line.startswith('#'):
-                continue
-            key, value = line.split('=', 1)
-            try:
-                info[key] = shlex.split(value)
-            except ValueError:
-                info[key] = [value]
+    for raw in f:
+        line = raw.decode('utf-8', 'surrogateescape').rstrip('\n')
+        if '=' not in line or line.startswith('#'):
+            continue
+        key, value = line.split('=', 1)
+        try:
+            info[key] = shlex.split(value)
+        except ValueError:
+            info[key] = [value]
     return info
 
 
@@ -206,15 +240,29 @@ class Backup:
         if os.path.exists(os.path.join(self.path, UNRESOLVED_LINKS)):
             raise BackupError(f'{self.path} has unresolved lateLinks, run '
                               'storeBackupUpdateBackup.pl first')
-        self.info = parse_info(info_file)
+        # owner and mode are checked below on the file that was read
+        self.info, info_stat = read_info(info_file)
         if not allow_unfinished and not self._finished():
             raise BackupError(f'{self.path} was not finished')
         self.postfix = (self.info.get('postfix') or [''])[0]
         self.uncompress = self.info.get('uncompress') or ['bzip2', '-d']
         self.codec = BUILTIN_CODECS.get(os.path.basename(self.uncompress[0]))
         if self.codec is None and not allow_external_uncompress:
-            # the program would run with our rights, usually root
-            st = os.stat(info_file)
+            # the program would run with our rights, usually root; the file
+            # read must be the one in the backup, not reached through a
+            # symbolic link to some file of root
+            st = info_stat
+            try:
+                lst = os.lstat(info_file)
+            except OSError:
+                lst = None
+            if lst is None or (lst.st_dev, lst.st_ino) != (st.st_dev,
+                                                           st.st_ino):
+                raise BackupError(
+                    f'{info_file} is a symbolic link (or was replaced) and '
+                    f'names the uncompress program '
+                    f'{shlex.join(self.uncompress)}; not run unless allowed '
+                    'explicitly')
             if st.st_uid not in (0, os.geteuid()) or st.st_mode & 0o022:
                 raise BackupError(
                     f'{info_file} (owner uid {st.st_uid}, mode '
@@ -463,13 +511,19 @@ class Backup:
         library, which releases the GIL; much faster than reading a stream)."""
         with open(path, 'rb') as f:
             if self.codec is not None:
-                return self.codec.decompress(f.read())
+                compressed = f.read()
+                try:
+                    return self.codec.decompress(compressed)
+                except Exception as e:
+                    if is_data_error(e):
+                        raise ChecksumError(f'{path!r} cannot be '
+                                            f'decompressed: {e}') from None
+                    raise
             proc = subprocess.run(self.uncompress, stdin=f,
                                   stdout=subprocess.PIPE,
                                   stderr=subprocess.DEVNULL)
         if proc.returncode:
-            raise BackupError(f'{shlex.join(self.uncompress)} failed with '
-                              f'status {proc.returncode} on {path!r}')
+            raise program_failed(self.uncompress, proc.returncode, path)
         return proc.stdout
 
     def _decompressed(self, path):
@@ -561,9 +615,12 @@ class PlainReader(Reader):
 class _Decompressor:
     """Thread decompressing a stream from ``start`` on into a buffer.
 
-    It stays at most ``ahead`` bytes ahead of the furthest read and keeps
-    ``behind`` bytes before it, as the kernel's parallel reads of one file
-    arrive slightly out of order.
+    It stays ahead of the furthest read by a step that starts at one chunk
+    and doubles while reads keep up with it, up to ``ahead`` bytes, so a
+    short read of a file costs little.  It keeps ``behind`` bytes before
+    the furthest read, as the kernel's parallel reads of one file arrive
+    slightly out of order, and nothing older, also while it skips forward
+    to a far read.
     """
 
     def __init__(self, open_stream, start, size, chunk, ahead, behind):
@@ -571,7 +628,9 @@ class _Decompressor:
         self.chunks = collections.deque()
         self.begin = self.end = start   # buffered: [begin, end)
         self.wanted = start             # furthest offset read
+        self.needed = start             # furthest end of a read
         self.ahead, self.behind = ahead, behind
+        self.step = min(chunk, ahead)   # current read-ahead
         self.eof = False
         self.error = None
         self.stopped = False
@@ -589,12 +648,14 @@ class _Decompressor:
                         break
                     pos += len(skipped)
                 if pos < start:
-                    self._put(b'')
+                    with self.cond:     # the stream ends before start
+                        self.begin = self.end = pos
                     return
                 while True:
                     with self.cond:
                         while not self.stopped and \
-                                self.end - self.wanted >= self.ahead:
+                                self.end >= self.needed and \
+                                self.end - self.wanted >= self.step:
                             self.cond.wait()
                         if self.stopped:
                             return
@@ -618,7 +679,14 @@ class _Decompressor:
             if data:
                 self.chunks.append(data)
                 self.end += len(data)
+                self._trim()
             self.cond.notify_all()
+
+    def _trim(self):
+        """Forget what lies well before the furthest read."""
+        while self.chunks and \
+                self.begin + len(self.chunks[0]) <= self.wanted - self.behind:
+            self.begin += len(self.chunks.popleft())
 
     def ready(self, offset, length):
         return self.begin <= offset and offset + length <= self.end
@@ -627,8 +695,16 @@ class _Decompressor:
         """Data at ``offset`` (shorter at the end of the stream), or None
         if it is not there yet and ``wait`` is false."""
         with self.cond:
-            if offset > self.wanted:
-                self.wanted = offset
+            if offset > self.wanted or offset + length > self.needed:
+                self.wanted = max(self.wanted, offset)
+                self.needed = max(self.needed, offset + length)
+                self.cond.notify_all()
+            # sequential reads catch up with the read-ahead (seeks beyond
+            # the buffer do not count): read further ahead
+            if self.begin < self.end and self.step < self.ahead and \
+                    self.begin <= offset <= self.end and \
+                    offset + length > self.end - self.step // 2:
+                self.step = min(2 * self.step, self.ahead)
                 self.cond.notify_all()
             while offset + length > self.end and not self.eof:
                 if not wait:
@@ -644,11 +720,7 @@ class _Decompressor:
                 pos += len(chunk)
                 if pos >= offset + length:
                     break
-            # forget what lies well before the furthest read
-            while self.chunks and \
-                    self.begin + len(self.chunks[0]) <= self.wanted - \
-                    self.behind:
-                self.begin += len(self.chunks.popleft())
+            self._trim()
             return b''.join(out)
 
     def stop(self):
@@ -669,12 +741,15 @@ class StreamReader(Reader):
     CHUNK = 1 << 20
     AHEAD = 8 << 20
     BEHIND = 4 << 20
+    LEAD = 1 << 20
+    RETRY_AFTER = 30                # seconds
 
     def __init__(self, open_stream, size):
         super().__init__()
         self.open_stream = open_stream
         self.size = size
         self.decompressor = None
+        self.failed = None          # (error, time) of the last read error
 
     def _ready(self, offset, length):
         length = min(length, self.size - offset)
@@ -685,16 +760,33 @@ class StreamReader(Reader):
         length = min(length, self.size - offset)
         if length <= 0:
             return b''
+        if self.failed is not None:
+            error, when = self.failed
+            if time.monotonic() - when < self.RETRY_AFTER:
+                raise error
+            self.failed = None
         if self.decompressor is None or offset < self.decompressor.begin:
             self._close()
+            # start a bit before: parallel reads arrive in any order, and
+            # the first one need not be the lowest
             self.decompressor = _Decompressor(
-                self.open_stream, offset, self.size, self.CHUNK, self.AHEAD,
-                self.BEHIND)
-        data = self.decompressor.get(offset, length)
+                self.open_stream, max(offset - self.LEAD, 0), self.size,
+                self.CHUNK, self.AHEAD, self.BEHIND)
+        try:
+            data = self.decompressor.get(offset, length)
+        except Exception as e:
+            self._close()
+            if is_data_error(e):
+                raise ChecksumError(f'cannot be decompressed: {e}') from None
+            # maybe passing: later reads fail at once for a while, then
+            # the stream starts again (not for each read: that would
+            # decompress up to the failing point every time)
+            self.failed = (e, time.monotonic())
+            raise
         if len(data) < length:
             raise ChecksumError(f'stored file ends after '
-                                f'{offset + len(data)} bytes, the checksum '
-                                f'file says {self.size}')
+                                f'{self.decompressor.end} bytes, the '
+                                f'checksum file says {self.size}')
         return data
 
     def _close(self):
@@ -739,8 +831,9 @@ class BlockReader(Reader):
         self.prefetch = prefetch
         self.pool = None
         self.pending = {}           # block index -> Future
-        self.cache_index = None
-        self.cache_data = b''
+        # the last blocks read: reads of one file arrive slightly out of
+        # order, also across block boundaries
+        self.cache = {}
         self.block_size = 0
         try:
             self.block_size = len(self._block(0)) if self.blocks else 0
@@ -764,29 +857,51 @@ class BlockReader(Reader):
                                 f'{BLOCK_CHECKSUM_FILE}')
         return data
 
-    def _block(self, index):
-        if index == self.cache_index:
-            return self.cache_data
+    # blocks kept after reading them: at least 2, and enough for 2 MB, as
+    # the kernel's parallel reads (up to 1 MB each) arrive out of order
+    CACHE_BYTES = 2 << 20
+
+    def _fetch(self, index):
+        """Contents of a block not in the cache, from the prefetch threads
+        or loaded now, with its length checked."""
         future = self.pending.pop(index, None)
         data = future.result() if future else self._load(index)
         if self.block_size and index < len(self.blocks) - 1 and \
                 len(data) != self.block_size:
-            raise BackupError(f'{self.path!r}: block {index} has '
+            raise ChecksumError(f'{self.path!r}: block {index} has '
                               f'{len(data)} bytes instead of '
                               f'{self.block_size}')
+        return data
+
+    def _prefetch(self, index):
+        """Load the blocks following ``index`` in the background, and stop
+        loading others."""
         window = range(index + 1,
                        min(index + 1 + self.prefetch, len(self.blocks)))
         for i in [i for i in self.pending if i not in window]:
             self.pending.pop(i).cancel()
-        if self.prefetch:
-            if self.pool is None:
-                self.pool = concurrent.futures.ThreadPoolExecutor(
-                    self.prefetch, thread_name_prefix='block')
-            for i in window:
-                if i not in self.pending:
-                    self.pending[i] = self.pool.submit(self._load, i)
-        self.cache_index, self.cache_data = index, data
+        if not self.prefetch:
+            return
+        if self.pool is None:
+            self.pool = concurrent.futures.ThreadPoolExecutor(
+                self.prefetch, thread_name_prefix='block')
+        for i in window:
+            if i not in self.pending and i not in self.cache:
+                self.pending[i] = self.pool.submit(self._load, i)
+
+    def _block(self, index):
+        if index in self.cache:     # forgotten in the order loaded
+            return self.cache[index]
+        data = self._fetch(index)
+        self._prefetch(index)
+        self._remember(index, data)
         return data
+
+    def _remember(self, index, data):
+        self.cache[index] = data
+        cached = max(2, -(-self.CACHE_BYTES // max(self.block_size, 1)))
+        while len(self.cache) > cached:
+            del self.cache[next(iter(self.cache))]
 
     def _ready(self, offset, length):
         """True if the blocks for this read are decompressed already."""
@@ -796,7 +911,7 @@ class BlockReader(Reader):
         for index in range(offset // self.block_size,
                            min((end - 1) // self.block_size + 1,
                                len(self.blocks))):
-            if index != self.cache_index:
+            if index not in self.cache:
                 future = self.pending.get(index)
                 if future is None or not future.done():
                     return False
@@ -810,21 +925,36 @@ class BlockReader(Reader):
             data = b''
             if index < len(self.blocks):
                 data = self._block(index)[start:start + end - offset]
-            if not data:
-                if index < len(self.blocks) - 1:
-                    raise BackupError(f'{self.path!r}: block {index} is '
-                                      'too short')
-                out.append(bytes(end - offset))     # beyond the blocks
+            if not data:            # beyond the blocks (all but the last
+                out.append(bytes(end - offset))     # have block_size)
                 break
             out.append(data)
             offset += len(data)
         return b''.join(out)
 
-    def stored_md5(self):
-        """Size and MD5 of all blocks together (each block is checked)."""
-        md5, size = hashlib.md5(), 0
-        for index in range(len(self.blocks)):
-            data = self._load(index)
+    def tail_start(self):
+        """Offset of the first block that may differ from what reads up to
+        the recorded size return: the last stored block, or the block
+        holding the recorded end if more blocks follow."""
+        if not self.blocks or not self.block_size:
+            return 0
+        return min(len(self.blocks) - 1,
+                   self.size // self.block_size) * self.block_size
+
+    def stored_md5(self, md5, start):
+        """Size and MD5 of all blocks together (each block is checked),
+        given the MD5 ``md5`` of the contents before ``start``, which
+        :meth:`tail_start` returned."""
+        md5 = md5.copy()
+        size = start
+        first = start // self.block_size if self.block_size else 0
+        for index in range(first, len(self.blocks)):
+            with self.lock:
+                data = self.cache.get(index)
+                if data is None:
+                    data = self._fetch(index)
+                    self._remember(index, data)
+                self._prefetch(index)
             md5.update(data)
             size += len(data)
         return size, md5.hexdigest()
@@ -835,7 +965,7 @@ class BlockReader(Reader):
         self.pending = {}
         if self.pool is not None:
             self.pool.shutdown(wait=False, cancel_futures=True)
-        self.cache_data = b''
+        self.cache.clear()
 
 
 class VerifyingReader(Reader):
@@ -867,20 +997,37 @@ class VerifyingReader(Reader):
         self.ahead_bytes = 0
         self.done = entry.inode in backup.verified
         self.error = None
+        self.end_read = False       # the read reaching the end was seen
+        # for files in blocks: MD5 of the contents before tail_start, so
+        # that the MD5 of the stored blocks costs only the blocks after it
+        tail_start = getattr(reader, 'tail_start', None)
+        self.tail_start = tail_start() if tail_start else None
+        self.tail_md5 = hashlib.md5() if self.tail_start == 0 else None
 
     def read(self, offset, length):
         with self.lock:
             return self._checked(offset, self.reader.read, length)
 
     def read_nowait(self, offset, length):
-        if not self.done and offset + length >= self.size:
-            return None             # completing the check may take long
         if not self.lock.acquire(blocking=False):
             return None
         try:
+            if self._may_finish(offset, length):
+                return None
             return self._checked(offset, self.reader.read_nowait, length)
         finally:
             self.lock.release()
+
+    def _may_finish(self, offset, length):
+        """True if this read may complete the check, which may take long:
+        then not in the event loop.  For files in blocks, a read filling
+        the last gap may make it read blocks again."""
+        if self.done:
+            return False
+        if offset + length >= self.size:
+            return True
+        return self.end_read and self.tail_start is not None and \
+            offset <= self.pos < offset + length
 
     def _checked(self, offset, read, length):
         if self.error is None and self.entry.inode in self.backup.bad:
@@ -896,6 +1043,8 @@ class VerifyingReader(Reader):
         return data
 
     def _account(self, offset, data):
+        if offset + len(data) >= self.size or not data:
+            self.end_read = True
         if offset > self.pos:
             if self.ahead_bytes + len(data) > self.MAX_AHEAD:
                 log.warning('%r read too far out of order, not checked',
@@ -921,9 +1070,17 @@ class VerifyingReader(Reader):
             self._finish()
 
     def _hash(self, offset, data):
-        if offset + len(data) > self.pos:
-            self.md5.update(data[self.pos - offset:])
-            self.pos = offset + len(data)
+        end = offset + len(data)
+        if end > self.pos:
+            cut = self.tail_start
+            if self.tail_md5 is None and cut is not None and \
+                    self.pos <= cut <= end:
+                self.md5.update(data[self.pos - offset:cut - offset])
+                self.tail_md5 = self.md5.copy()
+                self.md5.update(data[cut - offset:])
+            else:
+                self.md5.update(data[self.pos - offset:])
+            self.pos = end
 
     def _finish(self):
         self.done = True
@@ -932,14 +1089,22 @@ class VerifyingReader(Reader):
             self.backup.verified.add(self.entry.inode)
             return
         stored_md5 = getattr(self.reader, 'stored_md5', None)
-        if stored_md5 is not None:
+        # tail_md5 is set when pos passed tail_start (<= size)
+        if stored_md5 is not None and self.tail_md5 is not None:
             # storeBackup records the size of a file in blocks from before
             # reading it, but the MD5 of what it read (storeBackup.pl warns
             # "changed during backup")
             try:
-                stored, md5 = stored_md5()
+                stored, md5 = stored_md5(self.tail_md5, self.tail_start)
             except ChecksumError as e:
                 self._fail(f'{self.entry.path!r}: {e}')
+            except Exception as e:
+                # no proof of damage (EIO, missing block file, no memory,
+                # uncompress program failed): this read fails, the file stays readable; each
+                # block was checked against its own MD5 already
+                log.warning('%r: not checked as a whole, reading the stored '
+                            'blocks failed: %s', self.entry.path, e)
+                raise
             if md5 == self.entry.md5 and stored != self.size:
                 log.warning('%r changed while storeBackup read it: %d bytes '
                             'recorded, %d stored; shown with the recorded '
@@ -975,8 +1140,7 @@ class _ProcessStream:
     def read(self, n=-1):
         data = self.proc.stdout.read(n)
         if n and (n < 0 or not data) and self.proc.wait():
-            raise BackupError(f'{shlex.join(self.command)} failed with '
-                              f'status {self.proc.returncode}')
+            raise program_failed(self.command, self.proc.returncode)
         return data
 
     def close(self):

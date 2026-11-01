@@ -2,6 +2,7 @@
 # Copyright (C) 2026 Thomas Wagner
 import bz2
 import concurrent.futures
+import errno
 import gzip
 import hashlib
 import io
@@ -14,7 +15,7 @@ import pytest
 
 from storebackup_fuse.backup import (
     DIR, FILE, FIFO, SOCKET, SYMLINK, Backup, BackupError, ChecksumError,
-    StreamReader, parse_checksum_line, parse_info, parse_version,
+    BlockReader, StreamReader, parse_checksum_line, parse_version, read_info,
     unescape_name)
 
 
@@ -70,7 +71,7 @@ def test_parse_info(tmp_path):
     p = tmp_path / 'info'
     p.write_text("uncompress='bzip2' '-d'\npostfix='.bz2'\nexceptDirs=\n"
                  "comprRule='$size > 1024 and' 'not $file =~ /x/'\n")
-    info = parse_info(p)
+    info, _ = read_info(p)
     assert info['uncompress'] == ['bzip2', '-d']
     assert info['postfix'] == ['.bz2']
     assert info['exceptDirs'] == []
@@ -434,6 +435,7 @@ def test_stream_reader_restarts_for_backward_reads():
         opened.append(1)
         return io.BytesIO(b'0123456789')
     r = StreamReader(opener, 10)
+    r.LEAD = 0
     assert r.read(2, 3) == b'234'
     assert r.read(5, 2) == b'56'
     assert len(opened) == 1
@@ -442,11 +444,347 @@ def test_stream_reader_restarts_for_backward_reads():
     assert r.read(20, 2) == b''
 
 
+def test_stream_reader_restarts_a_bit_before_the_read():
+    data = os.urandom(4 << 20)
+    opened = []
+
+    def opener():
+        opened.append(1)
+        return io.BytesIO(data)
+    r = StreamReader(opener, len(data))
+    assert r.read(3 << 20, 10) == data[3 << 20:][:10]
+    assert r.read((3 << 20) - 4096, 10) == data[(3 << 20) - 4096:][:10]
+    assert len(opened) == 1
+    assert r.read(4096, 10) == data[4096:4106]
+    assert len(opened) == 2
+    r.close()
+
+
+def test_stream_reader_seeks_do_not_grow_the_read_ahead():
+    data = os.urandom(1 << 20)
+    r = small_stream_reader(lambda: io.BytesIO(data), len(data))
+    for pos in range(0, len(data) - 100, 64 << 10):
+        assert r.read(pos, 100) == data[pos:pos + 100]
+    assert r.decompressor.step <= 2 * r.CHUNK
+    r.close()
+
+
+@pytest.mark.parametrize('damage', [b'BZh9garbage', b''])
+def test_damaged_compressed_file_marked_bad(synthetic, damage):
+    data = os.urandom(100000)
+    sb = synthetic()
+    sb.file(b'c.txt', data, compr='c')
+    path = sb.write()
+    with open(os.path.join(path, 'c.txt.bz2'), 'r+b') as f:
+        if damage:
+            f.write(damage)
+        else:
+            f.truncate(os.fstat(f.fileno()).st_size // 2)
+    b = Backup(path)
+    entry = b.lookup('c.txt')
+    with pytest.raises(ChecksumError):
+        read_all(b, entry)
+    assert entry.inode in b.bad
+
+
+def test_only_known_library_errors_count_as_damage():
+    from storebackup_fuse.backup import is_data_error
+    for compress, decompress in ((bz2.compress, bz2.decompress),
+                                 (gzip.compress, gzip.decompress)):
+        for broken in (b'garbage' * 10, compress(b'x' * 1000)[:20]):
+            try:
+                decompress(broken)
+            except Exception as e:
+                assert is_data_error(e), e
+            else:
+                raise AssertionError('no error')
+    assert not is_data_error(ValueError('I/O operation on closed file'))
+    assert not is_data_error(OSError(errno.EIO, 'Input/output error'))
+
+
 def test_stream_reader_detects_early_end():
     r = StreamReader(lambda: io.BytesIO(b'0123'), 10)
     assert r.read(0, 4) == b'0123'
     with pytest.raises(ChecksumError, match='ends after 4 bytes'):
         r.read(4, 4)
+
+
+class CountingStream(io.BytesIO):
+    """Stream that records how much was read from it, and calls ``probe``
+    on every read."""
+
+    def __init__(self, data, probe=None):
+        super().__init__(data)
+        self.consumed = 0
+        self.probe = probe
+
+    def read(self, n=-1):
+        data = super().read(n)
+        self.consumed += len(data)
+        if self.probe:
+            self.probe()
+        return data
+
+
+def small_stream_reader(opener, size):
+    r = StreamReader(opener, size)
+    r.CHUNK, r.AHEAD, r.BEHIND, r.LEAD = 1 << 10, 8 << 10, 4 << 10, 1 << 10
+    return r
+
+
+def test_stream_reader_forward_seek_keeps_little_in_memory():
+    data = os.urandom(1 << 20)
+    peak = [0]
+
+    def probe():
+        d = r.decompressor
+        if d is not None:
+            peak[0] = max(peak[0], sum(len(c) for c in list(d.chunks)))
+    r = small_stream_reader(lambda: CountingStream(data, probe), len(data))
+    assert r.read(0, 100) == data[:100]
+    assert r.read(len(data) - 100, 100) == data[-100:]
+    assert peak[0] <= r.BEHIND + r.AHEAD + 2 * r.CHUNK
+    r.close()
+
+
+def test_stream_reader_short_read_decompresses_little():
+    data = os.urandom(1 << 20)
+    streams = []
+
+    def opener():
+        streams.append(CountingStream(data))
+        return streams[-1]
+    r = small_stream_reader(opener, len(data))
+    assert r.read(0, 100) == data[:100]
+    time.sleep(0.2)
+    assert streams[0].consumed <= 2 * r.CHUNK
+    # sequential reads make it read further ahead
+    for pos in range(0, 64 << 10, 512):
+        assert r.read(pos, 512) == data[pos:pos + 512]
+    assert r.decompressor.step == r.AHEAD
+    r.close()
+
+
+def test_stream_reader_reads_longer_than_the_read_ahead():
+    data = os.urandom(1 << 20)
+    r = small_stream_reader(lambda: io.BytesIO(data), len(data))
+    with concurrent.futures.ThreadPoolExecutor(1) as pool:
+        assert pool.submit(r.read, 0, 100).result(10) == data[:100]
+        assert pool.submit(r.read, 100, 300 << 10).result(10) == \
+            data[100:100 + (300 << 10)]
+    r.close()
+    r = small_stream_reader(lambda: io.BytesIO(data), len(data))
+    with concurrent.futures.ThreadPoolExecutor(1) as pool:
+        assert pool.submit(r.read, 0, len(data)).result(10) == data
+    r.close()
+
+
+def test_stream_reader_first_read_need_not_be_lowest():
+    opened = []
+
+    def opener():
+        opened.append(1)
+        return io.BytesIO(bytes(range(256)) * 1024)
+    r = StreamReader(opener, 256 * 1024)
+    assert r.read(128 << 10, 4) == bytes(range(4))
+    assert r.read(0, 4) == bytes(range(4))
+    assert len(opened) == 1
+    r.close()
+
+
+def test_stream_reader_early_end_reports_real_end():
+    r = StreamReader(lambda: io.BytesIO(b'0123'), 10)
+    with pytest.raises(ChecksumError, match='ends after 4 bytes'):
+        r.read(6, 2)
+
+
+@pytest.fixture
+def loaded(monkeypatch):
+    """Indexes of the blocks loaded (decompressed), in order."""
+    indexes = []
+    load = BlockReader._load
+
+    def counting_load(self, index):
+        indexes.append(index)
+        return load(self, index)
+    monkeypatch.setattr(BlockReader, '_load', counting_load)
+    return indexes
+
+
+def test_blocked_file_out_of_order_reads_load_each_block_once(
+        synthetic, loaded):
+    data = os.urandom(8 * 4096)
+    sb = synthetic()
+    sb.blocked(b'disk.img', data, block_size=4096)
+    b = Backup(sb.write())
+    reader = b.open(b.lookup('disk.img'), verify=False)
+    for index in range(1, 8):       # start of a block, then end of the last
+        assert reader.read(index * 4096, 100) == data[index * 4096:][:100]
+        assert reader.read(index * 4096 - 100, 100) == \
+            data[index * 4096 - 100:][:100]
+    reader.close()
+    assert sorted(loaded) == list(range(8))
+
+
+def test_blocked_file_changed_reads_only_the_tail_twice(
+        synthetic, loaded, caplog):
+    data = os.urandom(20 * 4096 + 500)
+    recorded = 18 * 4096 + 100
+    sb = synthetic()
+    sb.blocked(b'grew.img', data, block_size=4096, size=recorded)
+    b = Backup(sb.write())
+    entry = b.lookup('grew.img')
+    assert read_all(b, entry, step=4096) == data[:recorded]
+    assert entry.inode in b.verified
+    # blocks after the recorded end come from the prefetch threads
+    assert sorted(loaded) == list(range(21))
+
+
+def test_blocked_file_tail_read_error_gives_up_the_check(
+        synthetic, monkeypatch, caplog):
+    """A read error during the final check proves no damage: that read
+    fails, the file is not marked bad and stays readable (each block was
+    checked on its own)."""
+    data = os.urandom(4 * 4096 + 500)
+    sb = synthetic()
+    sb.blocked(b'grew.img', data, block_size=4096, size=3 * 4096 - 1000)
+    b = Backup(sb.write())
+    entry = b.lookup('grew.img')
+    load = BlockReader._load
+
+    def failing_load(self, index):
+        if index == 4:
+            raise OSError(errno.EIO, 'Input/output error')
+        return load(self, index)
+    monkeypatch.setattr(BlockReader, '_load', failing_load)
+    reader = b.open(entry)
+    with pytest.raises(OSError):
+        reader.read(0, entry.size)
+    assert 'not checked as a whole' in caplog.text
+    assert reader.read(0, 4096) == data[:4096]
+    assert entry.inode not in b.bad and entry.inode not in b.verified
+    reader.close()
+
+
+def test_stream_reader_starts_again_after_a_read_error():
+    data = os.urandom(300000)
+    failures = [1]
+
+    class Flaky(io.BytesIO):
+        def read(self, n=-1):
+            if self.tell() > 100000 and failures[0]:
+                failures[0] -= 1
+                raise OSError(errno.EIO, 'Input/output error')
+            return super().read(n)
+    r = small_stream_reader(lambda: Flaky(data), len(data))
+    assert r.read(0, 100) == data[:100]
+    with pytest.raises(OSError):
+        r.read(150000, 100)
+    with pytest.raises(OSError):    # fails at once for a while
+        r.read(150000, 100)
+    r.RETRY_AFTER = 0
+    assert r.read(150000, 100) == data[150000:150100]
+    r.close()
+
+
+def test_blocked_file_missing_tail_block_gives_up_the_check(synthetic):
+    """A missing block file proves no damage of the file (the backup may
+    be being deleted): the check is given up, the file is not marked."""
+    data = os.urandom(4 * 4096 + 500)
+    sb = synthetic()
+    paths = sb.blocked(b'grew.img', data, block_size=4096,
+                       size=3 * 4096 - 1000)
+    b = Backup(sb.write())
+    entry = b.lookup('grew.img')
+    os.unlink(paths[-1])            # needed only for the stored MD5
+    reader = b.open(entry)
+    with pytest.raises(FileNotFoundError):
+        reader.read(0, entry.size)
+    assert entry.inode not in b.bad
+    reader.close()
+
+
+def test_blocked_file_damaged_tail_marks_file_bad(synthetic):
+    data = os.urandom(4 * 4096 + 500)
+    sb = synthetic()
+    paths = sb.blocked(b'grew.img', data, block_size=4096,
+                       size=3 * 4096 - 1000)
+    b = Backup(sb.write())
+    entry = b.lookup('grew.img')
+    with open(paths[-1], 'r+b') as f:
+        f.truncate(10)              # broken bzip2 stream
+    reader = b.open(entry)
+    with pytest.raises(ChecksumError):
+        reader.read(0, entry.size)
+    assert entry.inode in b.bad
+    with pytest.raises(ChecksumError):
+        reader.read(0, 4096)
+    reader.close()
+
+
+def test_symlinked_info_file_naming_a_program_refused(synthetic, tmp_path):
+    sb = synthetic(uncompress="'sh' '-c' 'bzip2 -d'")
+    sb.file(b'c.txt', b'data', compr='c')
+    path = sb.write()
+    info = os.path.join(path, '.md5CheckSums.info')
+    os.rename(info, tmp_path / 'info')     # owned by root, mode 644
+    os.symlink(tmp_path / 'info', info)
+    with pytest.raises(BackupError, match='symbolic link'):
+        Backup(path)
+    Backup(path, allow_external_uncompress=True)
+
+
+def test_read_nowait_leaves_completing_the_check_to_threads(synthetic):
+    """Completing the check of a changed file in blocks reads blocks
+    again: never in the event loop, also not for a read in the middle that
+    fills the last gap."""
+    data = os.urandom(3 * 4096 + 500)
+    sb = synthetic()
+    sb.blocked(b'grew.img', data, block_size=4096, size=3 * 4096 - 1000)
+    b = Backup(sb.write())
+    entry = b.lookup('grew.img')
+    reader = b.open(entry)
+    assert reader.read(4096, entry.size) == data[4096:entry.size]
+    reader.reader.read(0, 4096)     # block 0 at hand
+    assert reader.read_nowait(0, 4096) is None
+    assert entry.inode not in b.verified
+    assert reader.read(0, 4096) == data[:4096]
+    assert entry.inode in b.verified
+    reader.close()
+
+
+def test_info_file_must_be_a_regular_file(synthetic, tmp_path):
+    sb = synthetic()
+    sb.file(b'x', b'y')
+    path = sb.write()
+    info = os.path.join(path, '.md5CheckSums.info')
+    os.rename(info, tmp_path / 'info')
+    os.symlink(tmp_path / 'info', info)
+    Backup(path)                    # built-in codec: nothing is run
+    os.unlink(info)
+    os.mkfifo(info)
+    with pytest.raises(BackupError):
+        Backup(path)
+
+
+def test_info_file_checked_on_the_file_read(synthetic, monkeypatch):
+    """The owner check uses the file that was parsed, not its name."""
+    sb = synthetic(uncompress="'sh' '-c' 'bzip2 -d'")
+    sb.file(b'c.txt', b'data', compr='c')
+    path = sb.write()
+    info = os.path.join(path, '.md5CheckSums.info')
+    os.chown(info, 1234, 1234)
+    stat_by_name = os.stat
+
+    def trusted_stat(p, *a, **kw):
+        st = stat_by_name(p, *a, **kw)
+        if os.fsdecode(p) == info:      # a swapped-in root-owned file
+            return os.stat_result((st.st_mode, st.st_ino, st.st_dev,
+                                   st.st_nlink, 0, 0) + tuple(st)[6:])
+        return st
+    monkeypatch.setattr(os, 'stat', trusted_stat)
+    with pytest.raises(BackupError, match='not run unless allowed'):
+        Backup(path)
 
 
 def test_verify_detects_corruption(synthetic):
