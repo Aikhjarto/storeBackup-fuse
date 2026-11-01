@@ -45,6 +45,7 @@ Options:
 |---|---|
 | `--no-verify` | Do not check the MD5 sums (see below) |
 | `--allow-unfinished` | Also mount backups that storeBackup considers unfinished |
+| `--allow-external-uncompress` | Run the backup's `uncompress=` program even if its info file is not owned by root (or the caller) or is writable by others |
 | `--allow-other` | Let other users access the mount; access is still checked against the recorded owner and mode |
 | `--debug` | Log every FUSE request |
 
@@ -61,16 +62,34 @@ any order of the reads), its size and MD5 are compared with
 `.md5CheckSums`. Files in blocks are also checked block by block against
 their `.md5BlockCheckSums` as the blocks are loaded. On a mismatch, the read
 fails with `EIO`, the error is logged, and the file cannot be opened again
-during this mount (hard links of it neither); data of a file that was not
-checked yet is not kept in the page cache, so a damaged file never reads
-without error. Uncompressed files whose stored size differs from the
-recorded one cannot be opened, also with `--no-verify`. Files read only in
-part, or in a very scattered order, are not checked as a whole.
+during this mount (hard links of it neither); other open handles of it fail
+on their next read.
+
+Every handle that reads a file completely gets the error, also when
+several programs read the same file (or hard links of it) at the same time:
+until a file has been verified, only one handle at a time uses the page
+cache and the others read directly (`direct_io`; `mmap` does not work for
+them), and data left in the page cache by an incomplete read is dropped.
+Files read only in part, or in a very scattered order, are not checked as a
+whole. Uncompressed files whose stored size differs from the recorded one
+cannot be opened, also with `--no-verify`.
 
 storeBackup records the size of a file in blocks from before reading it but
-the MD5 of what it read; if the file changed meanwhile (storeBackup logs
-"changed during backup"), it is shown with the recorded size and a warning is
-logged.
+the MD5 of what it read. If the file changed meanwhile (storeBackup logs
+"changed during backup"), it is checked against the MD5 of all stored
+blocks, shown with the recorded size (cut off, or filled up with zeros like
+`storeBackupRecover.pl` does), and a warning is logged. Unlike
+`storeBackupRecover.pl`, which writes all stored blocks, a file that grew is
+cut off at the recorded size.
+
+### Decompression
+
+`bzip2`, `gzip` and `xz` (also `lbzip2`, `pigz` etc.) are decompressed with
+Python's own modules; files are decompressed by worker threads ahead of the
+reads, several files in parallel. Any other `uncompress=` program from
+`.md5CheckSums.info` (e.g. `zstd`) is run, with the rights of the caller,
+only if the info file belongs to root or the caller and is not writable by
+others, or with `--allow-external-uncompress`.
 
 ### Inode numbers
 
@@ -84,7 +103,8 @@ over sshfs get new ones with every mount.
 
 Hard links of the source share one inode number; they are recognized by the
 source inode together with contents, owner, mode and mtime, all within one
-backup.
+backup. Sources read over sshfs have no hard links in the backup, as sshfs
+gives every path its own inode number.
 
 ## Example: moving a storeBackup series to restic
 

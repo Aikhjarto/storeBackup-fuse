@@ -13,8 +13,8 @@ import threading
 import pyfuse3
 import trio
 
-from .backup import (DECOMPRESSION_ERRORS, DIR, FILE, SYMLINK, BackupError,
-                     ChecksumError)
+from .backup import (BLOCKDEV, CHARDEV, DECOMPRESSION_ERRORS, DIR, FILE,
+                     SYMLINK, BackupError, ChecksumError)
 
 log = logging.getLogger(__name__)
 
@@ -41,8 +41,13 @@ class StoreBackupFS(pyfuse3.Operations):
         self.backup = backup
         self.verify = verify
         self.handles = {}
-        self.sorted_names = {}
+        self.dir_handles = {}       # fh -> [inode, sorted names or None]
         self.next_fh = itertools.count(1)
+        # inode -> number of open handles that use the page cache, for files
+        # not verified yet
+        self.cached_readers = {}
+        self.link_sizes = {}
+        self.rdevs = {}
 
     # -- metadata ----------------------------------------------------------
 
@@ -59,14 +64,21 @@ class StoreBackupFS(pyfuse3.Operations):
         attr.st_nlink = entry.nlink
         attr.st_uid = entry.uid
         attr.st_gid = entry.gid
-        attr.st_rdev = self.backup.rdev(entry)
+        # rdev and symlink sizes need the disk: once per entry only
+        if entry.kind in (BLOCKDEV, CHARDEV):
+            if entry.inode not in self.rdevs:
+                self.rdevs[entry.inode] = self.backup.rdev(entry)
+            attr.st_rdev = self.rdevs[entry.inode]
         if entry.kind == FILE:
             attr.st_size = entry.size
         elif entry.kind == SYMLINK:
-            try:
-                attr.st_size = len(self.backup.readlink(entry))
-            except OSError:
-                attr.st_size = 0    # readlink() reports the error
+            if entry.inode not in self.link_sizes:
+                try:
+                    self.link_sizes[entry.inode] = len(
+                        self.backup.readlink(entry))
+                except OSError:
+                    self.link_sizes[entry.inode] = 0    # readlink() logs
+            attr.st_size = self.link_sizes[entry.inode]
         else:
             attr.st_size = 0
         attr.st_blksize = 1 << 17
@@ -114,15 +126,18 @@ class StoreBackupFS(pyfuse3.Operations):
         entry = self._entry(inode)
         if entry.kind != DIR:
             raise pyfuse3.FUSEError(errno.ENOTDIR)
-        return inode
+        fh = next(self.next_fh)
+        self.dir_handles[fh] = [inode, None]
+        return fh
 
     @_handler
     async def readdir(self, fh, start_id, token):
-        entry = self._entry(fh)
+        handle = self.dir_handles[fh]
+        entry = self._entry(handle[0])
         # large directories are read in many calls: sort only once
-        names = self.sorted_names.get(fh)
+        names = handle[1]
         if names is None:
-            names = self.sorted_names[fh] = sorted(entry.children)
+            names = handle[1] = sorted(entry.children)
         for i in range(start_id, len(names)):
             child = entry.children[names[i]]
             if not pyfuse3.readdir_reply(token, names[i], self._attr(child),
@@ -131,7 +146,7 @@ class StoreBackupFS(pyfuse3.Operations):
 
     @_handler
     async def releasedir(self, fh):
-        self.sorted_names.pop(fh, None)
+        self.dir_handles.pop(fh, None)
 
     @_handler
     async def statfs(self, ctx):
@@ -165,15 +180,23 @@ class StoreBackupFS(pyfuse3.Operations):
             log.error('open %r: %s', entry.path, e)
             raise pyfuse3.FUSEError(errno.EIO) from None
         fh = next(self.next_fh)
-        self.handles[fh] = (entry, reader)
-        # pages cached by an earlier, incomplete read have not been checked:
-        # keep them only for files read completely with the right checksum
-        return pyfuse3.FileInfo(fh=fh, keep_cache=not self.verify or
-                                entry.inode in self.backup.verified)
+        if not self.verify or entry.inode in self.backup.verified:
+            self.handles[fh] = (entry, reader, False)
+            return pyfuse3.FileInfo(fh=fh, keep_cache=True)
+        # Not checked yet: every reader checks what it reads, so it must see
+        # all reads of the file itself.  One reader may use the page cache
+        # (dropping pages left by earlier incomplete reads); others read
+        # directly while it is open.
+        if self.cached_readers.get(entry.inode):
+            self.handles[fh] = (entry, reader, False)
+            return pyfuse3.FileInfo(fh=fh, direct_io=True)
+        self.cached_readers[entry.inode] = 1
+        self.handles[fh] = (entry, reader, True)
+        return pyfuse3.FileInfo(fh=fh, keep_cache=False)
 
     @_handler
     async def read(self, fh, off, size):
-        entry, reader = self.handles[fh]
+        entry, reader, _ = self.handles[fh]
         try:
             # answering in the event loop avoids a thread switch per
             # request, which costs ~40% throughput; only done when the data
@@ -204,9 +227,15 @@ class StoreBackupFS(pyfuse3.Operations):
 
     @_handler
     async def release(self, fh):
-        entry_reader = self.handles.pop(fh, None)
-        if entry_reader is not None:
-            await trio.to_thread.run_sync(entry_reader[1].close)
+        handle = self.handles.pop(fh, None)
+        if handle is not None:
+            entry, reader, cached = handle
+            if cached:
+                del self.cached_readers[entry.inode]
+            await trio.to_thread.run_sync(reader.close)
+
+
+STOP_SIGNALS = (signal.SIGTERM, signal.SIGINT, signal.SIGHUP)
 
 
 def mount(backup, mountpoint, verify=True, allow_other=False, debug=False):
@@ -221,11 +250,17 @@ def mount(backup, mountpoint, verify=True, allow_other=False, debug=False):
         options.add('allow_other')
     if debug:
         options.add('debug')
-    pyfuse3.init(fs, mountpoint, options)
+    # held back until _stop_on_signal is ready, so that a signal cannot
+    # leave a mount without its process behind
+    signal.pthread_sigmask(signal.SIG_BLOCK, STOP_SIGNALS)
     try:
-        trio.run(_serve)
+        pyfuse3.init(fs, mountpoint, options)
+        try:
+            trio.run(_serve)
+        finally:
+            pyfuse3.close(unmount=True)
     finally:
-        pyfuse3.close(unmount=True)
+        signal.pthread_sigmask(signal.SIG_UNBLOCK, STOP_SIGNALS)
 
 
 async def _serve():
@@ -236,8 +271,8 @@ async def _serve():
 
 
 async def _stop_on_signal(cancel_scope):
-    with trio.open_signal_receiver(signal.SIGTERM, signal.SIGINT,
-                                   signal.SIGHUP) as signals:
+    with trio.open_signal_receiver(*STOP_SIGNALS) as signals:
+        signal.pthread_sigmask(signal.SIG_UNBLOCK, STOP_SIGNALS)
         async for signum in signals:
             log.info('%s received, unmounting', signal.Signals(signum).name)
             cancel_scope.cancel()

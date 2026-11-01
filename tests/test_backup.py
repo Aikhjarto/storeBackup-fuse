@@ -8,6 +8,7 @@ import io
 import os
 import random
 import stat
+import time
 
 import pytest
 
@@ -245,7 +246,8 @@ def test_blocked_file_with_wrong_md5(synthetic):
 def test_blocked_file_changed_during_backup(synthetic, caplog, stored):
     """storeBackup records the size from before reading a file in blocks
     and the MD5 of what it read; such a file is shown with the recorded
-    size, not reported as damaged."""
+    size (filled up with zeros like storeBackupRecover.pl does), not
+    reported as damaged."""
     data = os.urandom(stored)
     recorded = 3 * 65536 - 1000
     sb = synthetic()
@@ -253,9 +255,87 @@ def test_blocked_file_changed_during_backup(synthetic, caplog, stored):
     b = Backup(sb.write())
     entry = b.lookup('grew.img')
     assert entry.size == recorded
-    assert read_all(b, entry) == data[:recorded]
+    expected = data[:recorded] + bytes(max(recorded - stored, 0))
+    assert read_all(b, entry) == expected
     assert 'changed while storeBackup read it' in caplog.text
-    assert entry.inode not in b.bad
+    assert entry.inode in b.verified
+
+
+def test_blocked_file_changed_with_blocks_in_wrong_order(synthetic):
+    """Each block matches its own MD5; only the MD5 of all stored data can
+    tell that the order is wrong."""
+    data = os.urandom(3 * 65536 + 500)
+    sb = synthetic()
+    sb.blocked(b'grew.img', data, block_size=65536, size=3 * 65536 - 1000)
+    csf = os.path.join(sb.path, 'grew.img', '.md5BlockCheckSums.bz2')
+    with bz2.open(csf, 'rb') as f:
+        lines = f.readlines()
+    lines[0], lines[1] = lines[1], lines[0]
+    with bz2.open(csf, 'wb') as f:
+        f.writelines(lines)
+    b = Backup(sb.write())
+    with pytest.raises(ChecksumError, match='do not match'):
+        read_all(b, b.lookup('grew.img'))
+
+
+def test_blocked_file_backward_reads_keep_little_in_memory(synthetic):
+    data = os.urandom(40 * 4096)
+    sb = synthetic()
+    sb.blocked(b'disk.img', data, block_size=4096)
+    b = Backup(sb.write())
+    reader = b.open(b.lookup('disk.img'), verify=False)
+    for index in reversed(range(40)):
+        assert reader.read(index * 4096, 4096) == data[index * 4096:][:4096]
+        assert len(reader.pending) <= reader.prefetch
+    reader.close()
+
+
+def test_other_readers_fail_once_file_is_bad(synthetic):
+    data = os.urandom(200000)
+    sb = synthetic()
+    sb.file(b'f', data)
+    b = Backup(sb.write())
+    with open(os.path.join(sb.path, 'f'), 'r+b') as f:
+        f.seek(150000)
+        f.write(b'?')
+    first, second = b.open(b.lookup('f')), b.open(b.lookup('f'))
+    assert second.read(0, 4096) == data[:4096]
+    with pytest.raises(ChecksumError):
+        read_all(b, b.lookup('f'))
+    with pytest.raises(ChecksumError):
+        first.read(0, 4096)
+    with pytest.raises(ChecksumError):
+        second.read(4096, 4096)
+    first.close()
+    second.close()
+
+
+def test_stream_reader_does_not_decompress_in_read_nowait(synthetic):
+    data = os.urandom(3 << 20)
+    sb = synthetic()
+    sb.file(b'c.txt', data, compr='c')
+    b = Backup(sb.write())
+    reader = b.open(b.lookup('c.txt'), verify=False)
+    assert reader.read_nowait(0, 4096) is None      # nothing there yet
+    assert reader.read(0, 4096) == data[:4096]
+    deadline = time.monotonic() + 10
+    while reader.read_nowait(4096, 4096) is None:   # decompressed ahead
+        assert time.monotonic() < deadline
+        time.sleep(0.01)
+    assert reader.read_nowait(4096, 4096) == data[4096:8192]
+    reader.close()
+
+
+def test_plain_reader_read_nowait(synthetic):
+    sb = synthetic()
+    sb.file(b'f', b'abcdef')
+    b = Backup(sb.write())
+    reader = b.open(b.lookup('f'), verify=False)
+    with open(os.path.join(sb.path, 'f'), 'rb') as f:
+        f.read()                                    # into the page cache
+    assert reader.read_nowait(1, 3) in (b'bcd', None)
+    assert reader.read_nowait(6, 3) == b''
+    reader.close()
 
 
 def test_blocked_file_block_of_wrong_length(synthetic):
@@ -286,6 +366,30 @@ def test_parallel_reads_on_one_reader(synthetic, name):
         for off, got in results:
             assert got == data[off:off + 5000], off
     reader.close()
+
+
+def test_external_uncompress_needs_trusted_info_file(synthetic):
+    """The program named by uncompress= runs with our rights (root)."""
+    sb = synthetic(uncompress="'sh' '-c' 'bzip2 -d'")
+    sb.file(b'c.txt', b'data', compr='c')
+    path = sb.write()
+    info = os.path.join(path, '.md5CheckSums.info')
+    os.chown(info, 1234, 1234)
+    with pytest.raises(BackupError, match='not run unless allowed'):
+        Backup(path)
+    assert read_all(Backup(path, allow_external_uncompress=True),
+                    Backup(path, True, True).lookup('c.txt')) == b'data'
+    os.chown(info, os.geteuid(), os.getegid())
+    os.chmod(info, 0o666)
+    with pytest.raises(BackupError, match='not run unless allowed'):
+        Backup(path)
+    os.chmod(info, 0o644)
+    Backup(path)
+    sb2 = synthetic('2026.01.02_00.00.00')        # built-in: no program
+    sb2.file(b'x', b'y')
+    path2 = sb2.write()
+    os.chown(os.path.join(path2, '.md5CheckSums.info'), 1234, 1234)
+    Backup(path2)
 
 
 def test_external_uncompress(synthetic):
@@ -615,3 +719,9 @@ def test_storebackup_md5_matches(storebackup_pair):
             assert hashlib.md5(data).hexdigest() == entry.md5, entry.path
         elif entry.kind == SYMLINK:
             assert backup.readlink(entry)
+
+
+def test_storebackup_late_links(storebackup_late_links):
+    assert storebackup_late_links['was_unresolved']
+    backup = Backup(storebackup_late_links['backup'])
+    compare_with_source(backup, storebackup_late_links['src'])

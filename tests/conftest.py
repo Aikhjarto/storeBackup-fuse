@@ -168,10 +168,10 @@ def make_source(src):
     os.utime(j(b'd', b'sub'), (1500000000, 1500000000))
 
 
-def run_storebackup(tmp, src, series='s'):
+def run_storebackup(tmp, src, series='s', extra=''):
     conf = os.path.join(tmp, 'storeBackup.conf')
     with open(conf, 'w') as f:
-        f.write(f"""sourceDir={src}
+        f.write(extra + f"""sourceDir={src}
 backupDir={tmp}/backups
 series={series}
 lockFile={tmp}/lock
@@ -212,3 +212,24 @@ def storebackup_pair(tmp_path_factory):
     second = run_storebackup(tmp, src)
     return {'first': first, 'second': second, 'src_first': snapshot,
             'src': src}
+
+
+@pytest.fixture(scope='session')
+def storebackup_late_links(tmp_path_factory):
+    """Backup made with lateLinks and lateCompress (as all series on the
+    author's server), before and after storeBackupUpdateBackup.pl."""
+    if STOREBACKUP is None:
+        pytest.skip('storeBackup.pl not installed')
+    if os.geteuid() != 0:
+        pytest.skip('storeBackup must run as root to keep owners')
+    tmp = str(tmp_path_factory.mktemp('latelinks'))
+    src = os.path.join(tmp, 'src')
+    make_source(src)
+    backup = run_storebackup(tmp, src, extra='lateLinks=yes\n'
+                             'lateCompress=yes\n')
+    unresolved = os.path.exists(os.path.join(
+        backup, '.storeBackupLinks', 'linkFile.bz2'))
+    subprocess.run([shutil.which('storeBackupUpdateBackup.pl'), '-b',
+                    os.path.join(tmp, 'backups')], check=True,
+                   stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    return {'backup': backup, 'src': src, 'was_unresolved': unresolved}

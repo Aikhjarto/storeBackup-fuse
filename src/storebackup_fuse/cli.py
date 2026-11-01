@@ -8,7 +8,7 @@ import sys
 import time
 
 from . import __version__
-from .backup import Backup, BackupError
+from .backup import DECOMPRESSION_ERRORS, Backup, BackupError
 
 
 def main(argv=None):
@@ -26,6 +26,10 @@ def main(argv=None):
     parser.add_argument('--allow-unfinished', action='store_true',
                         help='also mount backups that storeBackup '
                         'considers unfinished')
+    parser.add_argument('--allow-external-uncompress', action='store_true',
+                        help='run the uncompress program of the backup even '
+                        'if its info file may have been written by another '
+                        'user (bzip2, gzip and xz never run a program)')
     parser.add_argument('--allow-other', action='store_true',
                         help='let other users access the mount (needs '
                         'user_allow_other in /etc/fuse.conf for non-root)')
@@ -40,8 +44,10 @@ def main(argv=None):
 
     started = time.monotonic()
     try:
-        backup = Backup(args.backup, allow_unfinished=args.allow_unfinished)
-    except (OSError, BackupError) as e:
+        backup = Backup(
+            args.backup, allow_unfinished=args.allow_unfinished,
+            allow_external_uncompress=args.allow_external_uncompress)
+    except (OSError, BackupError) + DECOMPRESSION_ERRORS as e:
         log.error('%s', e)
         sys.exit(1)
     log.info('%s: %s entries loaded in %.1f s', backup.path,

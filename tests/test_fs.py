@@ -285,3 +285,97 @@ def test_sigterm_unmounts(synthetic, mount):
     assert m.proc.wait(timeout=20) == 0
     assert not os.path.ismount(m.mountpoint)
     assert os.listdir(m.mountpoint) == []
+
+
+def test_concurrent_readers_of_damaged_file(synthetic, mount):
+    """Readers of one file share the page cache; each must still get EIO
+    (same path twice, and hard links)."""
+    import threading
+    data = os.urandom(16 << 20)
+    bad = bytearray(data)
+    bad[11 << 20] ^= 1
+    sb = synthetic()
+    for i in range(3):
+        sb.file(b'bad%d' % i, data, dev_inode=f'7-{i}')
+        sb.file(b'bad%d link' % i, data, dev_inode=f'7-{i}')
+    path = sb.write()
+    for i in range(3):
+        for name in ('bad%d' % i, 'bad%d link' % i):
+            with open(os.path.join(path, name), 'wb') as f:
+                f.write(bad)
+    m = mount(path)
+    for i in range(3):
+        for names in (('bad%d' % i, 'bad%d' % i),
+                      ('bad%d' % i, 'bad%d link' % i)):
+            results = [None, None]
+
+            def run(k, name):
+                results[k] = cat(os.path.join(m.mountpoint, name))
+            threads = [threading.Thread(target=run, args=(k, n))
+                       for k, n in enumerate(names)]
+            for t in threads:
+                t.start()
+            for t in threads:
+                t.join()
+            assert results == [errno.EIO, errno.EIO], (names, results)
+    assert m.unmount() == 0, m.log
+
+
+def test_concurrent_readers_of_good_file(synthetic, mount):
+    import threading
+    data = os.urandom(16 << 20)
+    sb = synthetic()
+    sb.file(b'good', data, compr='c')
+    sb.file(b'good link', data, compr='c')
+    m = mount(sb.write())
+    results = []
+    threads = [threading.Thread(target=lambda n=n: results.append(
+        cat(os.path.join(m.mountpoint, n)))) for n in ('good', 'good link',
+                                                       'good')]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+    assert results == [hashlib.md5(data).hexdigest()] * 3
+    assert m.unmount() == 0, m.log
+
+
+def test_blocked_file_shrunk_during_backup(synthetic, mount):
+    data = os.urandom(2 * 65536 + 500)
+    recorded = 3 * 65536 - 1000
+    sb = synthetic()
+    sb.blocked(b'shrunk.img', data, block_size=65536, size=recorded)
+    m = mount(sb.write())
+    p = os.path.join(m.mountpoint, 'shrunk.img')
+    with open(p, 'rb') as f:
+        assert f.read() == data + bytes(recorded - len(data))
+    assert os.stat(p).st_size == recorded
+    m.unmount()
+    assert 'changed while storeBackup read it' in m.log
+
+
+def test_compressed_files_do_not_block_other_requests(synthetic, mount):
+    """Decompression runs in threads: several files in parallel, and
+    metadata requests are answered meanwhile."""
+    import statistics
+    import threading
+    data = os.urandom(24 << 20)     # random data: slow to decompress
+    sb = synthetic()
+    for i in range(3):
+        sb.file(b'c%d' % i, data, compr='c')
+    sb.file(b'other', b'x')
+    m = mount(sb.write(), '--no-verify')
+    threads = [threading.Thread(target=cat, args=(os.path.join(
+        m.mountpoint, 'c%d' % i),)) for i in range(3)]
+    for t in threads:
+        t.start()
+    latencies = []
+    while any(t.is_alive() for t in threads):
+        t0 = time.monotonic()
+        os.listdir(m.mountpoint)            # readdir is not cached
+        latencies.append(time.monotonic() - t0)
+        time.sleep(0.01)
+    for t in threads:
+        t.join()
+    assert statistics.median(latencies) < 0.02, latencies
+    assert m.unmount() == 0, m.log
